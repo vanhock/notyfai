@@ -1,0 +1,205 @@
+{
+  "info": {
+    "name": "Notyfai API",
+    "description": "Test login (Supabase JWT), create instance, get hook-setup, and send test webhook.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "supabase_url", "value": "https://your-project.supabase.co" },
+    { "key": "supabase_publishable_key", "value": "your-publishable-key" },
+    { "key": "test_email", "value": "test@example.com" },
+    { "key": "test_password", "value": "your-test-password" },
+    { "key": "base_url", "value": "http://localhost:3000" },
+    { "key": "access_token", "value": "" },
+    { "key": "instance_id", "value": "" },
+    { "key": "hook_url", "value": "" },
+    { "key": "otp_token", "value": "123456" }
+  ],
+  "item": [
+    {
+      "name": "Auth",
+      "item": [
+        {
+          "name": "Send OTP",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{test_email}}\"\n}"
+            },
+            "url": "{{base_url}}/api/auth/otp/send",
+            "description": "Send 6-digit OTP to email. In Supabase set Magic Link template to include {{ .Token }}. Then set otp_token and run Verify OTP."
+          }
+        },
+        {
+          "name": "Verify OTP",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access_token) { pm.collectionVariables.set('access_token', body.access_token); }"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"{{test_email}}\",\n  \"token\": \"{{otp_token}}\"\n}"
+            },
+            "url": "{{base_url}}/api/auth/otp/verify",
+            "description": "Verify code. Set otp_token to code from email first. Saves access_token."
+          }
+        },
+        {
+          "name": "Login (get JWT)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.access_token) {",
+                  "  pm.collectionVariables.set('access_token', body.access_token);",
+                  "  console.log('access_token saved');",
+                  "} else if (body.session && body.session.access_token) {",
+                  "  pm.collectionVariables.set('access_token', body.session.access_token);",
+                  "  console.log('access_token saved from session');",
+                  "} else {",
+                  "  console.log('No access_token in response:', JSON.stringify(body));",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "apikey", "value": "{{supabase_publishable_key}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"grant_type\": \"password\",\n  \"email\": \"{{test_email}}\",\n  \"password\": \"{{test_password}}\"\n}"
+            },
+            "url": "{{supabase_url}}/auth/v1/token",
+            "description": "Sign in with email/password. Requires a user created in Supabase Dashboard (Auth → Users). Saves access_token to collection variable for later requests."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Instances",
+      "item": [
+        {
+          "name": "Create instance",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.id) {",
+                  "  pm.collectionVariables.set('instance_id', body.id);",
+                  "  console.log('instance_id saved:', body.id);",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Postman test\"\n}"
+            },
+            "url": "{{base_url}}/api/instances",
+            "description": "Create a Cursor instance. Run after Login. Saves instance id for hook-setup."
+          }
+        },
+        {
+          "name": "List instances",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": "{{base_url}}/api/instances",
+            "description": "List all instances for the current user."
+          }
+        },
+        {
+          "name": "Get hook-setup",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "const body = pm.response.json();",
+                  "if (body.hook_url) {",
+                  "  pm.collectionVariables.set('hook_url', body.hook_url);",
+                  "  console.log('hook_url saved');",
+                  "}"
+                ],
+                "type": "text/javascript"
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "Authorization", "value": "Bearer {{access_token}}" }
+            ],
+            "url": "{{base_url}}/api/instances/{{instance_id}}/hook-setup",
+            "description": "Get hook URL, hooks_json, and copy_command for the instance. Run after Create instance. Saves hook_url for webhook test."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Webhook",
+      "item": [
+        {
+          "name": "Send test event (Cursor payload)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"hook_event_name\": \"stop\",\n  \"conversation_id\": \"postman-test\",\n  \"model\": \"test\",\n  \"cursor_version\": \"1.0\"\n}"
+            },
+            "url": "{{hook_url}}",
+            "description": "Send a Cursor-like payload to the webhook. Use the full hook_url from Get hook-setup (it includes ?token=...). If hook_url is empty, run Get hook-setup first or paste the URL manually."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "url": "{{base_url}}/health",
+            "description": "Check backend is running."
+          }
+        }
+      ]
+    }
+  ]
+}
