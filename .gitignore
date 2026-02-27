@@ -1,2 +1,29 @@
+# Env (keep .env.example)
 .env
 !.env.example
+backend/.env
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Node / backend
+backend/node_modules/
+backend/npm-debug.log*
+backend/.env.local
+backend/.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Build / output
+backend/dist/
+*.tsbuildinfo

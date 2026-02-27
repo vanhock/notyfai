@@ -4,6 +4,105 @@ import { getSupabaseAuth } from "../lib/supabase.js";
 const router = Router();
 
 /**
+ * POST /api/auth/signup
+ * Request body: { email: string, password: string }
+ * Creates a new user and returns the session.
+ */
+router.post("/signup", async (req: Request, res: Response): Promise<void> => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!email || !password) {
+    res.status(400).json({ error: "email and password are required" });
+    return;
+  }
+  const supabase = getSupabaseAuth();
+  const { data, error } = await supabase.auth.signUp({ email, password });
+  if (error) {
+    console.log("[auth] POST /signup error: %s", error.message);
+    res.status(400).json({ error: error.message });
+    return;
+  }
+  if (!data.session) {
+    res.status(200).json({ message: "Check your email to confirm your account" });
+    return;
+  }
+  const session = data.session;
+  res.status(200).json({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    user: data.user,
+  });
+});
+
+/**
+ * POST /api/auth/signin
+ * Request body: { email: string, password: string }
+ * Signs in with email/password and returns the session.
+ */
+router.post("/signin", async (req: Request, res: Response): Promise<void> => {
+  const email = typeof req.body?.email === "string" ? req.body.email.trim() : "";
+  const password = typeof req.body?.password === "string" ? req.body.password : "";
+  if (!email || !password) {
+    res.status(400).json({ error: "email and password are required" });
+    return;
+  }
+  const supabase = getSupabaseAuth();
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) {
+    console.log("[auth] POST /signin error: %s", error.message);
+    res.status(400).json({ error: error.message });
+    return;
+  }
+  if (!data.session) {
+    res.status(400).json({ error: "No session returned" });
+    return;
+  }
+  const session = data.session;
+  res.status(200).json({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    user: data.user,
+  });
+});
+
+/**
+ * POST /api/auth/google
+ * Request body: { id_token: string }
+ * Exchanges a Google ID token (from Flutter google_sign_in) for a Supabase session.
+ */
+router.post("/google", async (req: Request, res: Response): Promise<void> => {
+  const idToken = typeof req.body?.id_token === "string" ? req.body.id_token.trim() : "";
+  if (!idToken) {
+    res.status(400).json({ error: "id_token is required" });
+    return;
+  }
+  const supabase = getSupabaseAuth();
+  const { data, error } = await supabase.auth.signInWithIdToken({
+    provider: "google",
+    token: idToken,
+  });
+  if (error) {
+    console.log("[auth] POST /google error: %s", error.message);
+    res.status(400).json({ error: error.message });
+    return;
+  }
+  if (!data.session) {
+    res.status(400).json({ error: "No session returned" });
+    return;
+  }
+  const session = data.session;
+  console.log("[auth] POST /google: success userId=%s", session.user?.id ?? "?");
+  res.status(200).json({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    user: data.user,
+  });
+});
+
+/**
  * POST /api/auth/otp/send
  * Request body: { email: string }
  * Sends a 6-digit OTP to the email via Supabase.
