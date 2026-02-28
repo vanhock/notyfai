@@ -67,3 +67,26 @@ Then create `~/.cursor/scripts/notyfai-send.sh` and `~/.cursor/hooks.json` as in
 ## Localhost note
 
 If your backend runs on `localhost`, Cursor (and the script) must be able to reach it. For a backend on your machine, `http://localhost:3000` is fine. For a backend on another machine or in the cloud, use that host in the hook URL instead.
+
+## Troubleshooting: no notifications
+
+1. **Backend running and reachable**  
+   With the backend running, trigger a Cursor hook (e.g. run a command). In the backend logs you should see:
+   - `[hooks] POST /cursor received` — the request reached the server.
+   - If you never see this, the hook URL may be wrong or the backend not running. Test from a terminal:
+     ```bash
+     curl -s -X POST -H "Content-Type: application/json" -d '{"hook_event_name":"stop"}' 'YOUR_HOOK_URL'
+     ```
+     Use the same URL as in `~/.cursor/notyfai-url` or `NOTYFAI_HOOK_URL`.
+
+2. **Token and instance**  
+   If you see `missing token` or `invalid token`, fix the hook URL (include `?token=...`) or ensure `HOOK_SECRET` in the backend matches the secret used when the token was created. If you see `instance not found`, the token’s instance is not in this backend’s database.
+
+3. **Events stored**  
+   When the backend accepts the hook it logs: `[hooks] cursor event received` with `instanceId`, `userId`, `eventType`. Then it stores the event and tries to send a push.
+
+4. **Push not sent**  
+   If you see `[notifications] no push tokens for user ... - register a device in the app to receive notifications`, open the Notyfai app on your device, log in, and ensure the app has registered the device (e.g. via the devices/notification flow). Push tokens are created when the app calls `POST /api/devices/token`.
+
+5. **Push sent**  
+   If you see `[notifications] sending push to N device(s) ...`, the backend sent the notification to FCM. If it still doesn’t appear on the device, check device notification permissions, app in foreground/background, and FCM configuration (e.g. Firebase project, `google-services.json` / `GoogleService-Info.plist`).
