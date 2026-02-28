@@ -182,4 +182,37 @@ router.post("/otp/verify", async (req: Request, res: Response): Promise<void> =>
   });
 });
 
+/**
+ * POST /api/auth/refresh
+ * Request body: { refresh_token: string }
+ * Exchanges a valid refresh token for a new session (access_token, refresh_token, expires_in, user).
+ * Supabase refresh tokens are single-use; each refresh returns a new refresh token.
+ * See: https://supabase.com/docs/reference/javascript/auth-refreshsession
+ */
+router.post("/refresh", async (req: Request, res: Response): Promise<void> => {
+  const refreshToken = typeof req.body?.refresh_token === "string" ? req.body.refresh_token.trim() : "";
+  if (!refreshToken) {
+    res.status(400).json({ error: "refresh_token is required" });
+    return;
+  }
+  const supabase = getSupabaseAuth();
+  const { data, error } = await supabase.auth.refreshSession({ refresh_token: refreshToken });
+  if (error) {
+    console.log("[auth] POST /refresh error: %s", error.message);
+    res.status(401).json({ error: error.message });
+    return;
+  }
+  if (!data.session) {
+    res.status(401).json({ error: "No session returned" });
+    return;
+  }
+  const session = data.session;
+  res.status(200).json({
+    access_token: session.access_token,
+    refresh_token: session.refresh_token,
+    expires_in: session.expires_in,
+    user: data.user,
+  });
+});
+
 export default router;

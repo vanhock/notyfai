@@ -4,6 +4,7 @@ import { requireAuth } from "./middleware/auth.js";
 import authRouter from "./routes/auth.js";
 import hooksRouter from "./routes/hooks.js";
 import instancesRouter from "./routes/instances.js";
+import devicesRouter from "./routes/devices.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -17,6 +18,7 @@ app.get("/health", (_req, res) => {
 app.use("/api/auth", authRouter);
 app.use("/api/hooks", hooksRouter);
 app.use("/api/instances", requireAuth, instancesRouter);
+app.use("/api/devices", requireAuth, devicesRouter);
 
 app.listen(PORT, () => {
   console.log(`Notyfai backend listening on port ${PORT}`);
