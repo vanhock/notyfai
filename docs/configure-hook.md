@@ -40,18 +40,27 @@ After you get a `hook-setup` response from the API (or from the app), use one of
    {
      "version": 1,
      "hooks": {
-       "stop": [{ "command": "./scripts/notyfai-send.sh" }],
-       "beforeShellExecution": [{ "command": "./scripts/notyfai-send.sh" }],
-       "beforeMCPExecution": [{ "command": "./scripts/notyfai-send.sh" }]
+       "sessionStart":          [{ "command": "./scripts/notyfai-send.sh" }],
+       "beforeShellExecution":  [{ "command": "./scripts/notyfai-send.sh" }],
+       "beforeMCPExecution":    [{ "command": "./scripts/notyfai-send.sh" }],
+       "afterShellExecution":   [{ "command": "./scripts/notyfai-send.sh" }],
+       "afterMCPExecution":     [{ "command": "./scripts/notyfai-send.sh" }],
+       "afterAgentResponse":    [{ "command": "./scripts/notyfai-send.sh" }],
+       "stop":                  [{ "command": "./scripts/notyfai-send.sh" }]
      }
    }
    ```
 
    (Paths are relative to `~/.cursor/` when the file is at `~/.cursor/hooks.json`.)
 
+   The hooks capture the full lifecycle of each agent run: session start, tool use
+   (with input and output), agent responses, and completion. Only `beforeShellExecution`
+   and `beforeMCPExecution` trigger push notifications (the agent is blocked waiting);
+   `stop` triggers an immediate notification when the agent finishes.
+
 4. **Restart Cursor** so it loads the new hooks.
 
-After that, when Cursor fires `stop`, `beforeShellExecution`, or `beforeMCPExecution`, it will run the script with the event JSON on stdin, and the script will POST it to your hook URL.
+After setup, Cursor fires all configured hooks with event JSON on stdin, and the script POSTs it to your hook URL. Events are grouped by `generation_id` into agent execution threads visible in the app.
 
 ## Option B: Use environment variable instead of file
 

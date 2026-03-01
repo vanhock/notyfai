@@ -1,8 +1,14 @@
 import { Router, Request, Response } from "express";
+import { randomUUID } from "crypto";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { verifyAndGetInstanceId } from "../lib/token.js";
-import { normalizeEventType, type CursorHookPayload } from "../types/cursor.js";
+import {
+  normalizeEventType,
+  toSemanticType,
+  type CursorHookPayload,
+  type SemanticEventType,
+} from "../types/cursor.js";
 import { sendPushNotification } from "../lib/notifications.js";
 
 const router = Router();
@@ -51,13 +57,77 @@ function trackAndCheckAbuse(instanceId: string): boolean {
   return entry.count > ABUSE_THRESHOLD;
 }
 
+/** Keyed by execution_id — debounced push for agentBlocked events. */
 const pendingNotifications = new Map<string, NodeJS.Timeout>();
 
-function cancelPending(instanceId: string): void {
-  const existing = pendingNotifications.get(instanceId);
+function cancelPending(executionId: string): void {
+  const existing = pendingNotifications.get(executionId);
   if (existing) {
     clearTimeout(existing);
-    pendingNotifications.delete(instanceId);
+    pendingNotifications.delete(executionId);
+  }
+}
+
+/**
+ * Upsert an agent_execution row for the given (instance_id, generation_id).
+ * Returns { executionId, isNew }.
+ */
+async function upsertExecution(
+  instanceId: string,
+  generationId: string,
+  conversationId: string | undefined,
+  status: string
+): Promise<{ executionId: string; isNew: boolean }> {
+  // Try insert first (most common path)
+  const { data: inserted, error: insertError } = await supabaseAdmin
+    .from("agent_executions")
+    .insert({
+      instance_id: instanceId,
+      generation_id: generationId,
+      conversation_id: conversationId ?? null,
+      status: "running",
+    })
+    .select("id")
+    .single();
+
+  if (!insertError && inserted) {
+    return { executionId: inserted.id as string, isNew: true };
+  }
+
+  // Row already exists — fetch it and update status if needed
+  const { data: existing, error: fetchError } = await supabaseAdmin
+    .from("agent_executions")
+    .select("id, status")
+    .eq("instance_id", instanceId)
+    .eq("generation_id", generationId)
+    .single();
+
+  if (fetchError || !existing) {
+    throw new Error(`[hooks] failed to upsert execution: ${fetchError?.message ?? "unknown"}`);
+  }
+
+  const executionId = existing.id as string;
+
+  // Only advance status forward: running → blocked → stopped
+  const rank: Record<string, number> = { running: 0, blocked: 1, stopped: 2 };
+  if ((rank[status] ?? -1) > (rank[existing.status as string] ?? -1)) {
+    await supabaseAdmin
+      .from("agent_executions")
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq("id", executionId);
+  }
+
+  return { executionId, isNew: false };
+}
+
+function executionStatusForSemantic(semanticType: SemanticEventType): string {
+  switch (semanticType) {
+    case "agentBlocked":
+      return "blocked";
+    case "agentStopped":
+      return "stopped";
+    default:
+      return "running";
   }
 }
 
@@ -108,25 +178,73 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     await supabaseAdmin.from("cursor_instances").update({ revoked: true }).eq("id", instanceId);
     sendPushNotification(
       instance.user_id,
-      "unknown",
-      `Security alert: hook URL for "${instance.name ?? instanceId.slice(0, 8)}" was disabled due to suspicious activity.`,
-      instanceId
+      "agentStopped",
+      { status: "error", hook_event_name: "stop" },
+      `Security alert: hook URL for "${instance.name ?? instanceId.slice(0, 8)}" disabled due to suspicious activity.`
     ).catch(() => {});
     res.status(429).json({ error: "Instance auto-revoked due to excessive requests." });
     return;
   }
 
   const body = req.body as CursorHookPayload | undefined;
-  const payload = body && typeof body === "object" ? body : {};
+  const payload = body && typeof body === "object" ? body : ({} as CursorHookPayload);
   const eventType = normalizeEventType(
     payload.hook_event_name ?? (req.headers["x-cursor-event"] as string)
   );
+  const semanticType = toSemanticType(eventType);
 
-  console.log("[hooks] event received instanceId=%s userId=%s eventType=%s", instanceId, instance.user_id, eventType);
+  // Use generation_id from payload; fall back to a stable UUID derived from conversation+session for grouping
+  const generationId = (payload.generation_id as string | undefined) ?? randomUUID();
+  const conversationId = payload.conversation_id as string | undefined;
 
+  console.log(
+    "[hooks] event received instanceId=%s userId=%s eventType=%s semanticType=%s generationId=%s",
+    instanceId,
+    instance.user_id,
+    eventType,
+    semanticType,
+    generationId
+  );
+
+  // Upsert the execution thread
+  let executionId: string;
+  let isNewExecution: boolean;
+  try {
+    const result = await upsertExecution(
+      instanceId,
+      generationId,
+      conversationId,
+      executionStatusForSemantic(semanticType)
+    );
+    executionId = result.executionId;
+    isNewExecution = result.isNew;
+  } catch (err) {
+    console.error("[hooks] execution upsert failed:", err);
+    res.status(500).json({ error: "Failed to track execution" });
+    return;
+  }
+
+  // If this is a new execution and the first event isn't already agentStart, insert a synthetic agentStart
+  if (isNewExecution && semanticType !== "agentStart") {
+    await supabaseAdmin.from("cursor_events").insert({
+      instance_id: instanceId,
+      execution_id: executionId,
+      event_type: "sessionStart",
+      semantic_type: "agentStart",
+      payload: {
+        hook_event_name: "sessionStart",
+        generation_id: generationId,
+        conversation_id: conversationId ?? null,
+      },
+    });
+  }
+
+  // Insert the actual event
   const { error: insertError } = await supabaseAdmin.from("cursor_events").insert({
     instance_id: instanceId,
+    execution_id: executionId,
     event_type: eventType,
+    semantic_type: semanticType,
     payload,
   });
 
@@ -143,30 +261,27 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
 
   res.status(202).json({ ok: true });
 
+  // Notification filter check (only applies to push-eligible types)
   const filters = instance.notification_filters;
-  if (filters !== null && !filters.includes(eventType)) {
+  if (filters !== null && !filters.includes(eventType) && !filters.includes(semanticType)) {
     console.log("[hooks] notification suppressed by filter for event type: %s", eventType);
     return;
   }
 
-  cancelPending(instanceId);
+  cancelPending(executionId);
 
-  if (eventType === "stop") {
-    sendPushNotification(instance.user_id, eventType, instance.name, instanceId).catch((err) => {
+  if (semanticType === "agentStopped") {
+    sendPushNotification(instance.user_id, semanticType, payload, instance.name, executionId).catch((err) => {
       console.error("[hooks] sendPushNotification error:", err);
     });
-  } else if (eventType === "beforeShellExecution" || eventType === "beforeMCPExecution") {
+  } else if (semanticType === "agentBlocked") {
     const timeout = setTimeout(() => {
-      pendingNotifications.delete(instanceId);
-      sendPushNotification(instance.user_id, eventType, instance.name, instanceId).catch((err) => {
+      pendingNotifications.delete(executionId);
+      sendPushNotification(instance.user_id, semanticType, payload, instance.name, executionId).catch((err) => {
         console.error("[hooks] sendPushNotification (debounced) error:", err);
       });
     }, 15_000);
-    pendingNotifications.set(instanceId, timeout);
-  } else {
-    sendPushNotification(instance.user_id, eventType, instance.name, instanceId).catch((err) => {
-      console.error("[hooks] sendPushNotification error:", err);
-    });
+    pendingNotifications.set(executionId, timeout);
   }
 });
 

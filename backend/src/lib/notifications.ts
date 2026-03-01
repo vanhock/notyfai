@@ -1,47 +1,86 @@
 import { getMessaging } from "firebase-admin/messaging";
 import { supabaseAdmin } from "./supabase.js";
 import { getFirebaseApp } from "./firebase.js";
-import type { CursorEventType } from "../types/cursor.js";
+import type { CursorHookPayload, SemanticEventType } from "../types/cursor.js";
 
 type NotificationContent = { title: string; body: string };
 
-function getNotificationContent(
-  eventType: CursorEventType | "unknown",
-  instanceName: string | null
-): NotificationContent {
-  const body = instanceName || "Cursor";
-  switch (eventType) {
-    case "stop":
-      return { title: "Cursor stopped", body };
-    case "beforeShellExecution":
-    case "beforeMCPExecution":
-      return { title: "Cursor awaiting for action", body };
-    default:
-      return { title: "Cursor event", body };
+function truncate(str: string, max: number): string {
+  return str.length <= max ? str : `${str.slice(0, max - 1)}…`;
+}
+
+function getMcpServer(payload: CursorHookPayload): string {
+  const urlOrCmd = (payload.url ?? payload.command) as string | undefined;
+  if (!urlOrCmd) return "";
+  // For URL-based servers show just the host; for command-based show the binary name
+  try {
+    return new URL(urlOrCmd).host;
+  } catch {
+    return urlOrCmd.split(/[\s/\\]/).find(Boolean) ?? urlOrCmd;
   }
 }
 
-/** Tracks the last time a notification was sent per instance (for throttling). */
+function getNotificationContent(
+  semanticType: SemanticEventType,
+  payload: CursorHookPayload,
+  instanceName: string | null
+): NotificationContent {
+  const name = instanceName ?? "Cursor";
+
+  switch (semanticType) {
+    case "agentBlocked": {
+      if (payload.hook_event_name === "beforeMCPExecution" || payload.tool_name) {
+        const tool = (payload.tool_name as string | undefined) ?? "MCP tool";
+        const server = getMcpServer(payload);
+        return {
+          title: `Awaiting: ${tool}`,
+          body: server ? `${server} — ${name}` : name,
+        };
+      }
+      // beforeShellExecution
+      const cmd = typeof payload.command === "string" ? payload.command : "";
+      return {
+        title: "Awaiting shell action",
+        body: cmd ? `${truncate(cmd, 60)} — ${name}` : name,
+      };
+    }
+
+    case "agentStopped": {
+      const stopStatus = typeof payload.status === "string" ? payload.status : "";
+      const label =
+        stopStatus === "aborted"
+          ? "Aborted"
+          : stopStatus === "error"
+            ? "Error"
+            : "Completed";
+      return { title: "Agent stopped", body: `${label} — ${name}` };
+    }
+
+    default:
+      return { title: "Cursor event", body: name };
+  }
+}
+
+/** Tracks the last time a notification was sent per execution (for throttling). */
 const lastNotificationSentAt = new Map<string, number>();
 
-/** Minimum ms between push notifications for the same instance. */
+/** Minimum ms between push notifications for the same execution. */
 const NOTIFICATION_THROTTLE_MS = 5_000;
 
 export async function sendPushNotification(
   userId: string,
-  eventType: CursorEventType | "unknown",
+  semanticType: SemanticEventType,
+  payload: CursorHookPayload,
   instanceName: string | null,
-  instanceId?: string
+  executionId?: string
 ): Promise<void> {
-  // Throttle: skip FCM if a notification was sent too recently for this instance
-  if (instanceId) {
-    const last = lastNotificationSentAt.get(instanceId);
-    if (last !== undefined && Date.now() - last < NOTIFICATION_THROTTLE_MS) {
-      console.log("[notifications] throttled push for instance %s (last sent %dms ago)", instanceId, Date.now() - last);
-      return;
-    }
-    lastNotificationSentAt.set(instanceId, Date.now());
+  const throttleKey = executionId ?? userId;
+  const last = lastNotificationSentAt.get(throttleKey);
+  if (last !== undefined && Date.now() - last < NOTIFICATION_THROTTLE_MS) {
+    console.log("[notifications] throttled push for execution %s (last sent %dms ago)", throttleKey, Date.now() - last);
+    return;
   }
+  lastNotificationSentAt.set(throttleKey, Date.now());
 
   const { data: tokens, error } = await supabaseAdmin
     .from("push_tokens")
@@ -53,15 +92,15 @@ export async function sendPushNotification(
     return;
   }
   if (!tokens || tokens.length === 0) {
-    console.warn("[notifications] no push tokens for user", userId, "- register a device in the app to receive notifications");
+    console.warn("[notifications] no push tokens for user", userId, "- register a device in the app");
     return;
   }
 
-  const { title, body } = getNotificationContent(eventType, instanceName);
+  const { title, body } = getNotificationContent(semanticType, payload, instanceName);
   const messaging = getMessaging(getFirebaseApp());
   const staleIds: string[] = [];
 
-  console.log("[notifications] sending push to", tokens.length, "device(s) for user", userId, "event:", eventType);
+  console.log("[notifications] sending push to", tokens.length, "device(s) for user", userId, "semantic:", semanticType);
 
   await Promise.allSettled(
     tokens.map(async ({ id, token, platform }: { id: string; token: string; platform: string }) => {
@@ -69,8 +108,16 @@ export async function sendPushNotification(
         await messaging.send({
           token,
           notification: { title, body },
-          apns: platform === "ios" ? { payload: { aps: { sound: "default" } } } : undefined,
-          android: platform === "android" ? { notification: { sound: "default" } } : undefined,
+          apns: {
+            headers: executionId ? { "apns-thread-id": executionId } : undefined,
+            payload: { aps: { sound: "default" } },
+          },
+          android: {
+            notification: {
+              tag: executionId,
+              sound: "default",
+            },
+          },
         });
       } catch (err: unknown) {
         const code = (err as { errorInfo?: { code?: string } })?.errorInfo?.code;
@@ -85,6 +132,6 @@ export async function sendPushNotification(
 
   if (staleIds.length > 0) {
     await supabaseAdmin.from("push_tokens").delete().in("id", staleIds);
-    console.log("[notifications] Removed %d stale token(s)", staleIds.length);
+    console.log("[notifications] removed %d stale token(s)", staleIds.length);
   }
 }

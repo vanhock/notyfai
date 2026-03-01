@@ -47,7 +47,7 @@ router.get("/", async (req: Request, res: Response<unknown, AuthLocals>): Promis
 
   const { data: events, error, count } = await supabaseAdmin
     .from("cursor_events")
-    .select("id, instance_id, event_type, payload, created_at", { count: "exact" })
+    .select("id, instance_id, execution_id, event_type, semantic_type, payload, created_at", { count: "exact" })
     .in("instance_id", instanceIds)
     .order("created_at", { ascending: false })
     .range(offset, offset + limit - 1);
