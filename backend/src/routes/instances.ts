@@ -132,18 +132,36 @@ router.get("/:id/hook-setup", async (req: Request, res: Response<unknown, AuthLo
   const signedToken = signInstanceId(instance.id, version);
   const hookUrl = `${BASE_URL}/api/hooks/cursor?token=${encodeURIComponent(signedToken)}`;
 
+  const hookEntry = [{ command: ".cursor/hooks/notyfai-send.sh" }];
   res.json({
     instance_id: instance.id,
     hook_url: hookUrl,
     hooks_json: {
       version: 1,
       hooks: {
-        stop: [{ command: "./scripts/notyfai-send.sh" }],
-        beforeShellExecution: [{ command: "./scripts/notyfai-send.sh" }],
-        beforeMCPExecution: [{ command: "./scripts/notyfai-send.sh" }],
+        sessionStart: hookEntry,
+        sessionEnd: hookEntry,
+        beforeSubmitPrompt: hookEntry,
+        subagentStart: hookEntry,
+        subagentStop: hookEntry,
+        preToolUse: hookEntry,
+        postToolUse: hookEntry,
+        postToolUseFailure: hookEntry,
+        beforeReadFile: hookEntry,
+        afterFileEdit: hookEntry,
+        beforeTabFileRead: hookEntry,
+        afterTabFileEdit: hookEntry,
+        beforeShellExecution: hookEntry,
+        afterShellExecution: hookEntry,
+        beforeMCPExecution: hookEntry,
+        afterMCPExecution: hookEntry,
+        afterAgentResponse: hookEntry,
+        afterAgentThought: hookEntry,
+        preCompact: hookEntry,
+        stop: hookEntry,
       },
     },
-    copy_command: `echo '${hookUrl}' > ~/.cursor/notyfai-url`,
+    copy_command: `mkdir -p .cursor/hooks && echo '${hookUrl}' > .cursor/notyfai-url`,
     env_var: `NOTYFAI_HOOK_URL='${hookUrl}'`,
   });
 });

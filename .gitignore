@@ -10,6 +10,7 @@ Thumbs.db
 # IDE
 .idea/
 .vscode/
+.cursor/notyfai-url
 *.swp
 *.swo
 *~

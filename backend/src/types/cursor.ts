@@ -1,11 +1,31 @@
+/**
+ * All Cursor hook event types from https://cursor.com/docs/agent/hooks
+ * (Agent: sessionStart, sessionEnd, preToolUse, postToolUse, postToolUseFailure,
+ *  subagentStart, subagentStop, beforeShellExecution, afterShellExecution,
+ *  beforeMCPExecution, afterMCPExecution, beforeReadFile, afterFileEdit,
+ *  beforeSubmitPrompt, preCompact, stop, afterAgentResponse, afterAgentThought;
+ *  Tab: beforeTabFileRead, afterTabFileEdit)
+ */
 export const CURSOR_EVENT_TYPES = [
   "sessionStart",
+  "sessionEnd",
+  "beforeSubmitPrompt",
+  "subagentStart",
+  "subagentStop",
   "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "beforeReadFile",
+  "afterFileEdit",
+  "beforeTabFileRead",
+  "afterTabFileEdit",
   "beforeShellExecution",
-  "beforeMCPExecution",
   "afterShellExecution",
+  "beforeMCPExecution",
   "afterMCPExecution",
   "afterAgentResponse",
+  "afterAgentThought",
+  "preCompact",
   "stop",
 ] as const;
 
@@ -15,27 +35,53 @@ export const SEMANTIC_EVENT_TYPES = [
   "agentStart",
   "agentBlocked",
   "agentStopped",
+  "toolStart",
   "toolResult",
   "agentMessage",
 ] as const;
 
 export type SemanticEventType = (typeof SEMANTIC_EVENT_TYPES)[number];
 
+/**
+ * Maps a raw Cursor event type to its default semantic type.
+ * Permission-bearing hooks (before*Execution, beforeReadFile, beforeTabFileRead)
+ * default to agentBlocked here; callers in hooks.ts use resolveSemanticType()
+ * to treat only permission "ask" | "deny" as blocking, and "allow" | undefined as toolStart.
+ * Only "stop" maps to agentStopped; eventType "unknown" is never treated as agentStopped.
+ */
 export function toSemanticType(eventType: CursorEventType | "unknown"): SemanticEventType {
   switch (eventType) {
     case "sessionStart":
+    case "beforeSubmitPrompt":
       return "agentStart";
+    case "subagentStart":
+    case "preToolUse":
+      return "toolStart";
     case "beforeShellExecution":
     case "beforeMCPExecution":
+    case "beforeReadFile":
+    case "beforeTabFileRead":
       return "agentBlocked";
     case "afterShellExecution":
     case "afterMCPExecution":
+    case "postToolUse":
+    case "postToolUseFailure":
+    case "subagentStop":
+    case "afterFileEdit":
+    case "afterTabFileEdit":
+    case "preCompact":
       return "toolResult";
     case "afterAgentResponse":
+    case "afterAgentThought":
       return "agentMessage";
+    case "sessionEnd":
+      // Session lifecycle only; do not treat as agent stop (avoid duplicate execution/stop logs)
+      return "toolResult";
     case "stop":
-    default:
       return "agentStopped";
+    default:
+      // unknown or future event types: do not treat as agentStopped (no push, no status=stopped)
+      return "toolResult";
   }
 }
 
@@ -55,9 +101,11 @@ export interface CursorHookPayload {
   composer_mode?: string;
   is_background_agent?: boolean;
 
-  // preToolUse
+  // preToolUse / postToolUse / postToolUseFailure
   tool_use_id?: string;
   agent_message?: string;
+  is_error?: boolean;
+  tool_use_result?: string;
 
   // beforeShellExecution / afterShellExecution
   command?: string;
@@ -71,18 +119,56 @@ export interface CursorHookPayload {
   url?: string;
   result_json?: string;
 
-  // afterAgentResponse
+  // beforeReadFile / beforeTabFileRead / afterFileEdit / afterTabFileEdit
+  file_path?: string;
+  edits?: Array<{ old_string?: string; new_string?: string; range?: unknown }>;
+
+  // subagentStart / subagentStop
+  subagent_id?: string;
+  subagent_description?: string;
+  subagent_type?: string;
+
+  // afterAgentResponse / afterAgentThought / sessionEnd
   text?: string;
+  duration_ms?: number;
+  reason?: string;
+  final_status?: string;
+  error_message?: string;
 
   // stop
   status?: string;
   loop_count?: number;
+
+  // preCompact
+  trigger?: string;
+  context_usage_percent?: number;
+  context_tokens?: number;
+  message_count?: number;
+
+  // beforeSubmitPrompt: user's initial message (agent description/title)
+  prompt?: string;
+
+  // Permission-bearing hooks (beforeShellExecution, beforeMCPExecution,
+  // beforeReadFile, beforeTabFileRead)
+  permission?: "allow" | "deny" | "ask";
+  user_message?: string;
 
   [key: string]: unknown;
 }
 
 export function normalizeEventType(raw: string | undefined): CursorEventType | "unknown" {
   if (!raw) return "unknown";
-  if (CURSOR_EVENT_TYPES.includes(raw as CursorEventType)) return raw as CursorEventType;
-  return "unknown";
+  const exact = CURSOR_EVENT_TYPES.includes(raw as CursorEventType);
+  if (exact) return raw as CursorEventType;
+  // Case-insensitive match so e.g. "subAgentStop" from Cursor is not treated as "unknown" → agentStopped
+  const canonical = CURSOR_EVENT_TYPES.find((t) => t.toLowerCase() === raw.toLowerCase());
+  return canonical ?? "unknown";
 }
+
+/** Set of permission-bearing hook types that require a permission check. */
+export const PERMISSION_BEARING_HOOKS = new Set<CursorEventType>([
+  "beforeShellExecution",
+  "beforeMCPExecution",
+  "beforeReadFile",
+  "beforeTabFileRead",
+]);

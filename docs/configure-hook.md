@@ -88,11 +88,17 @@ If your backend runs on `localhost`, Cursor (and the script) must be able to rea
      ```
      Use the same URL as in `~/.cursor/notyfai-url` or `NOTYFAI_HOOK_URL`.
 
+   **Testing blocking vs non-blocking:** To see backend logs that clearly show which events are BLOCKING (agent waiting for user) vs NOT BLOCKING, run the test script (with your hook URL set):
+   ```bash
+   HOOK_URL='http://localhost:3000/api/hooks/cursor?token=YOUR_JWT' ./docs/test-blocking-hook.sh
+   ```
+   Backend will log e.g. `[hooks] BLOCKING | ... eventType=beforeMCPExecution permission=ask → semanticType=agentBlocked`. Only `permission` "ask" or "deny" is blocking; "allow" or omitted permission produces `[hooks] NOT BLOCKING | ... → semanticType=toolStart`.
+
 2. **Token and instance**  
    If you see `missing token` or `invalid token`, fix the hook URL (include `?token=...`) or ensure `HOOK_SECRET` in the backend matches the secret used when the token was created. If you see `instance not found`, the token’s instance is not in this backend’s database.
 
 3. **Events stored**  
-   When the backend accepts the hook it logs: `[hooks] cursor event received` with `instanceId`, `userId`, `eventType`. Then it stores the event and tries to send a push.
+   When the backend accepts the hook it logs: `[hooks] BLOCKING | ...` or `[hooks] NOT BLOCKING | ...` with `instanceId`, `userId`, and the reason (`eventType`, `permission`, `semanticType`). Then it stores the event and, for blocking events, schedules a push after 15s.
 
 4. **Push not sent**  
    If you see `[notifications] no push tokens for user ... - register a device in the app to receive notifications`, open the Notyfai app on your device, log in, and ensure the app has registered the device (e.g. via the devices/notification flow). Push tokens are created when the app calls `POST /api/devices/token`.
