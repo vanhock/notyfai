@@ -27,3 +27,4 @@ npm-debug.log*
 # Build / output
 backend/dist/
 *.tsbuildinfo
+backend/supabase/.temp/cli-latest

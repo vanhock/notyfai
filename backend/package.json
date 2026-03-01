@@ -11,6 +11,7 @@
     "@supabase/supabase-js": "^2.45.0",
     "dotenv": "^17.3.1",
     "express": "^4.21.0",
+    "express-rate-limit": "^8.2.1",
     "firebase-admin": "^13.7.0"
   },
   "devDependencies": {
