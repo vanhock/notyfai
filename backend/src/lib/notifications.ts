@@ -21,11 +21,28 @@ function getNotificationContent(
   }
 }
 
+/** Tracks the last time a notification was sent per instance (for throttling). */
+const lastNotificationSentAt = new Map<string, number>();
+
+/** Minimum ms between push notifications for the same instance. */
+const NOTIFICATION_THROTTLE_MS = 5_000;
+
 export async function sendPushNotification(
   userId: string,
   eventType: CursorEventType | "unknown",
-  instanceName: string | null
+  instanceName: string | null,
+  instanceId?: string
 ): Promise<void> {
+  // Throttle: skip FCM if a notification was sent too recently for this instance
+  if (instanceId) {
+    const last = lastNotificationSentAt.get(instanceId);
+    if (last !== undefined && Date.now() - last < NOTIFICATION_THROTTLE_MS) {
+      console.log("[notifications] throttled push for instance %s (last sent %dms ago)", instanceId, Date.now() - last);
+      return;
+    }
+    lastNotificationSentAt.set(instanceId, Date.now());
+  }
+
   const { data: tokens, error } = await supabaseAdmin
     .from("push_tokens")
     .select("id, token, platform")
