@@ -15,8 +15,6 @@
     "preToolUse": [{ "command": ".cursor/hooks/notyfai-send.sh" }],
     "postToolUse": [{ "command": ".cursor/hooks/notyfai-send.sh" }],
     "postToolUseFailure": [{ "command": ".cursor/hooks/notyfai-send.sh" }],
-    "subagentStart": [{ "command": ".cursor/hooks/notyfai-send.sh" }],
-    "subagentStop": [{ "command": ".cursor/hooks/notyfai-send.sh" }],
     "stop": [{ "command": ".cursor/hooks/notyfai-send.sh" }]
   }
 }

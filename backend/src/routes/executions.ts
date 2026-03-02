@@ -175,33 +175,36 @@ router.get("/", async (req: Request, res: Response<unknown, AuthLocals>): Promis
   // ——— Step 5: Merge all execution rows + events per session into one response object ———
   // Returns one merged row per session/thread. The client receives one object per thread
   // with all events already combined and sorted, and started_at set to the earliest turn.
-  const result = pageReps.map((rep) => {
-    const sessionKey = rep.session_id ?? rep.conversation_id ?? rep.id;
-    const sessionExecs = allSessionExecs.filter((e) => (e.session_id ?? e.conversation_id ?? e.id) === sessionKey);
+  const result = pageReps
+    .map((rep) => {
+      const sessionKey = rep.session_id ?? rep.conversation_id ?? rep.id;
+      const sessionExecs = allSessionExecs.filter((e) => (e.session_id ?? e.conversation_id ?? e.id) === sessionKey);
 
-    if (sessionExecs.length === 0) {
-      return { ...rep, events: [] };
-    }
+      if (sessionExecs.length === 0) {
+        // Avoid returning incomplete rep (missing started_at, etc.) which would break the client.
+        return null;
+      }
 
-    // Most-recently-updated execution provides the authoritative status / updated_at
-    const latest = sessionExecs.reduce((l, e) => (e.updated_at > l.updated_at ? e : l), sessionExecs[0]);
-    // Earliest started_at is the session start
-    const startedAt = sessionExecs.reduce(
-      (min, e) => (e.started_at < min ? e.started_at : min),
-      sessionExecs[0].started_at
-    );
+      // Most-recently-updated execution provides the authoritative status / updated_at
+      const latest = sessionExecs.reduce((l, e) => (e.updated_at > l.updated_at ? e : l), sessionExecs[0]);
+      // Earliest started_at is the session start
+      const startedAt = sessionExecs.reduce(
+        (min, e) => (e.started_at < min ? e.started_at : min),
+        sessionExecs[0].started_at
+      );
 
-    // Collect and chronologically sort all events from all turns in the session
-    const mergedEvents = sessionExecs
-      .flatMap((e) => (eventsByExecution.get(e.id) ?? []) as Array<{ created_at: string }>)
-      .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      // Collect and chronologically sort all events from all turns in the session
+      const mergedEvents = sessionExecs
+        .flatMap((e) => (eventsByExecution.get(e.id) ?? []) as Array<{ created_at: string }>)
+        .sort((a, b) => a.created_at.localeCompare(b.created_at));
 
-    return {
-      ...latest,
-      started_at: startedAt,
-      events: mergedEvents,
-    };
-  });
+      return {
+        ...latest,
+        started_at: startedAt,
+        events: mergedEvents,
+      };
+    })
+    .filter((r): r is NonNullable<typeof r> => r != null);
 
   res.json({ executions: result, total, limit, offset });
 });

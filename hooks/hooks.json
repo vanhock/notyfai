@@ -14,8 +14,6 @@
     "preToolUse": [{ "command": "./scripts/notyfai-send.sh" }],
     "postToolUse": [{ "command": "./scripts/notyfai-send.sh" }],
     "postToolUseFailure": [{ "command": "./scripts/notyfai-send.sh" }],
-    "subagentStart": [{ "command": "./scripts/notyfai-send.sh" }],
-    "subagentStop": [{ "command": "./scripts/notyfai-send.sh" }],
     "stop": [{ "command": "./scripts/notyfai-send.sh" }]
   }
 }

@@ -23,26 +23,27 @@ function getMcpServer(payload: CursorHookPayload): string {
 function getNotificationContent(
   semanticType: SemanticEventType,
   payload: CursorHookPayload,
-  instanceName: string | null
+  instanceName: string | null,
+  prompt?: string | null
 ): NotificationContent {
   const name = instanceName ?? "Cursor";
+
+  let title: string;
+  let body: string;
 
   switch (semanticType) {
     case "agentBlocked": {
       if (payload.hook_event_name === "beforeMCPExecution" || payload.tool_name) {
         const tool = (payload.tool_name as string | undefined) ?? "MCP tool";
         const server = getMcpServer(payload);
-        return {
-          title: `Awaiting: ${tool}`,
-          body: server ? `${server} — ${name}` : name,
-        };
+        title = `Awaiting: ${tool}`;
+        body = server ? `${server} — ${name}` : name;
+      } else {
+        const cmd = typeof payload.command === "string" ? payload.command : "";
+        title = "Awaiting shell action";
+        body = cmd ? `${truncate(cmd, 60)} — ${name}` : name;
       }
-      // beforeShellExecution
-      const cmd = typeof payload.command === "string" ? payload.command : "";
-      return {
-        title: "Awaiting shell action",
-        body: cmd ? `${truncate(cmd, 60)} — ${name}` : name,
-      };
+      break;
     }
 
     case "agentStopped": {
@@ -53,12 +54,21 @@ function getNotificationContent(
           : stopStatus === "error"
             ? "Error"
             : "Completed";
-      return { title: "Agent stopped", body: `${label} — ${name}` };
+      title = "Agent stopped";
+      body = `${label} — ${name}`;
+      break;
     }
 
     default:
-      return { title: "Cursor event", body: name };
+      title = "Cursor event";
+      body = name;
   }
+
+  // Use original prompt as notification title when available (thread title)
+  if (prompt != null && prompt.trim() !== "") {
+    return { title: truncate(prompt.trim(), 80), body };
+  }
+  return { title, body };
 }
 
 /** Tracks the last time a notification was sent per execution (for throttling). */
@@ -82,6 +92,16 @@ export async function sendPushNotification(
   }
   lastNotificationSentAt.set(throttleKey, Date.now());
 
+  let prompt: string | null = null;
+  if (executionId) {
+    const { data: row } = await supabaseAdmin
+      .from("agent_executions")
+      .select("prompt")
+      .eq("id", executionId)
+      .single();
+    if (row?.prompt != null) prompt = row.prompt as string;
+  }
+
   const { data: tokens, error } = await supabaseAdmin
     .from("push_tokens")
     .select("id, token, platform")
@@ -96,7 +116,7 @@ export async function sendPushNotification(
     return;
   }
 
-  const { title, body } = getNotificationContent(semanticType, payload, instanceName);
+  const { title, body } = getNotificationContent(semanticType, payload, instanceName, prompt);
   const messaging = getMessaging(getFirebaseApp());
   const staleIds: string[] = [];
 
@@ -108,6 +128,7 @@ export async function sendPushNotification(
         await messaging.send({
           token,
           notification: { title, body },
+          data: executionId ? { execution_id: executionId } : undefined,
           apns: {
             headers: executionId ? { "apns-thread-id": executionId } : undefined,
             payload: { aps: { sound: "default" } },

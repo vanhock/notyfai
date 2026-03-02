@@ -1,12 +1,10 @@
 import { Router, Request, Response } from "express";
-import { randomUUID } from "crypto";
 import rateLimit, { ipKeyGenerator } from "express-rate-limit";
 import { supabaseAdmin } from "../lib/supabase.js";
 import { verifyAndGetInstanceId } from "../lib/token.js";
 import {
   normalizeEventType,
   toSemanticType,
-  PERMISSION_BEARING_HOOKS,
   type CursorHookPayload,
   type CursorEventType,
   type SemanticEventType,
@@ -26,7 +24,7 @@ type HookInstance = {
 
 const hookRateLimit = rateLimit({
   windowMs: 10 * 60 * 1000,
-  max: 150,
+  max: 400,
   keyGenerator: (req) => {
     const rawToken = req.query.token ?? req.headers["x-notyfai-token"];
     const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
@@ -46,7 +44,7 @@ const hookRateLimit = rateLimit({
 
 const requestCounts = new Map<string, { count: number; windowStart: number }>();
 const ABUSE_WINDOW_MS = 60 * 60 * 1000;
-const ABUSE_THRESHOLD = 200;
+const ABUSE_THRESHOLD = 500;
 
 function trackAndCheckAbuse(instanceId: string): boolean {
   const now = Date.now();
@@ -59,25 +57,14 @@ function trackAndCheckAbuse(instanceId: string): boolean {
   return entry.count > ABUSE_THRESHOLD;
 }
 
-/** Debounce window (ms) before sending push for permission-based agentBlocked. */
-const BLOCKING_PUSH_DEBOUNCE_MS = 15_000;
+/** If no hook activity for this long, treat execution as blocking and notify. */
+const TOOL_RUN_BLOCKING_THRESHOLD_MS = 3 * 60 * 1000;
 
-/** If a tool run has no follow-up event for this long, treat as blocking and notify. */
-const TOOL_RUN_BLOCKING_THRESHOLD_MS = 5 * 60 * 1000;
+/** Keyed by execution_id — latest event context stored for the inactivity timer. */
+const pendingBlockInfo = new Map<string, { eventType: string; toolName: string | null; payload: CursorHookPayload }>();
 
-/** Keyed by execution_id — debounced push for agentBlocked events. */
-const pendingNotifications = new Map<string, NodeJS.Timeout>();
-
-/** Keyed by execution_id — timeout to treat long-running tool (no after* in 5 min) as blocking. */
+/** Keyed by execution_id — inactivity timeout; fires → mark blocked + push. */
 const pendingStaleBlockingTimeouts = new Map<string, NodeJS.Timeout>();
-
-function cancelPending(executionId: string): void {
-  const existing = pendingNotifications.get(executionId);
-  if (existing) {
-    clearTimeout(existing);
-    pendingNotifications.delete(executionId);
-  }
-}
 
 function cancelStaleBlockingTimeout(executionId: string): void {
   const existing = pendingStaleBlockingTimeouts.get(executionId);
@@ -85,51 +72,11 @@ function cancelStaleBlockingTimeout(executionId: string): void {
     clearTimeout(existing);
     pendingStaleBlockingTimeouts.delete(executionId);
   }
+  pendingBlockInfo.delete(executionId);
 }
-
-/**
- * Resolves the semantic type for an event, applying the permission override
- * for hooks that carry a permission field (before*Execution, beforeReadFile, etc.).
- * Blocking (agentBlocked) only when permission is explicitly "deny" or "ask".
- * - permission "ask" | "deny" → agentBlocked (blocking, push)
- * - permission "allow" | undefined (not specified) → toolStart (not blocking)
- */
-function resolveSemanticType(
-  eventType: CursorEventType | "unknown",
-  payload: CursorHookPayload
-): SemanticEventType {
-  const base = toSemanticType(eventType);
-  if (base === "agentBlocked" && PERMISSION_BEARING_HOOKS.has(eventType as CursorEventType)) {
-    const perm = payload.permission;
-    if (perm === "ask" || perm === "deny") return "agentBlocked";
-    return "toolStart"; // allow or undefined
-  }
-  return base;
-}
-
-/** Returns true if this event is a "blocking" one (agent waiting for user action). */
-function isBlockingEvent(semanticType: SemanticEventType): boolean {
-  return semanticType === "agentBlocked";
-}
-
-/** Before* hooks: agent is in a blocking window until matching after* or stop. */
-const BEFORE_BLOCKING_HOOKS = new Set<CursorEventType>([
-  "beforeShellExecution",
-  "beforeMCPExecution",
-  "beforeReadFile",
-  "beforeTabFileRead",
-]);
-
-/** After* hooks: end the blocking window for the current tool call. */
-const AFTER_BLOCKING_HOOKS = new Set<CursorEventType>([
-  "afterShellExecution",
-  "afterMCPExecution",
-  "afterFileEdit",
-  "afterTabFileEdit",
-]);
 
 function blockingToolNameFromPayload(
-  eventType: CursorEventType | "unknown",
+  _eventType: CursorEventType | "unknown",
   payload: CursorHookPayload
 ): string | null {
   const toolName = payload.tool_name;
@@ -139,6 +86,47 @@ function blockingToolNameFromPayload(
   const filePath = payload.file_path;
   if (typeof filePath === "string" && filePath.length > 0) return filePath;
   return null;
+}
+
+/**
+ * Resets the 3-minute inactivity timer for an execution.
+ * If no further hook fires within the threshold, the execution is marked blocked and a push is sent.
+ */
+function scheduleBlockingCheck(
+  executionId: string,
+  userId: string,
+  instanceName: string | null,
+  eventType: CursorEventType | "unknown",
+  payload: CursorHookPayload
+): void {
+  const toolName = blockingToolNameFromPayload(eventType, payload);
+  cancelStaleBlockingTimeout(executionId);
+  pendingBlockInfo.set(executionId, { eventType: eventType as string, toolName, payload });
+  const timeout = setTimeout(async () => {
+    pendingStaleBlockingTimeouts.delete(executionId);
+    const info = pendingBlockInfo.get(executionId);
+    pendingBlockInfo.delete(executionId);
+    const { data: row } = await supabaseAdmin
+      .from("agent_executions")
+      .select("id, status")
+      .eq("id", executionId)
+      .single();
+    if (!row || row.status === "stopped") return;
+    await supabaseAdmin
+      .from("agent_executions")
+      .update({
+        status: "blocked",
+        blocked_since: new Date().toISOString(),
+        blocking_event_type: info?.eventType ?? null,
+        blocking_tool_name: info?.toolName ?? null,
+      })
+      .eq("id", executionId);
+    console.log("[hooks] no hook activity for 3 min → marking blocked executionId=%s", executionId);
+    sendPushNotification(userId, "agentBlocked", info?.payload ?? payload, instanceName, executionId).catch((err) => {
+      console.error("[hooks] sendPushNotification (inactivity) error:", err);
+    });
+  }, TOOL_RUN_BLOCKING_THRESHOLD_MS);
+  pendingStaleBlockingTimeouts.set(executionId, timeout);
 }
 
 type ExecutionMetadata = {
@@ -198,8 +186,8 @@ async function upsertExecution(
 
   const executionId = existing.id as string;
 
-  // Forward-only: pending(0) → running(1) → blocked(2) → stopped(3)
-  const rank: Record<string, number> = { pending: 0, running: 1, blocked: 2, stopped: 3 };
+  // Forward-only: pending(0) → running(1) → stopped(2); blocked is a temporary state, not ranked
+  const rank: Record<string, number> = { pending: 0, running: 1, stopped: 2 };
   const updates: {
     status?: string;
     updated_at: string;
@@ -223,19 +211,6 @@ async function upsertExecution(
   return { executionId, isNew: false };
 }
 
-function executionStatusForSemantic(semanticType: SemanticEventType): string {
-  switch (semanticType) {
-    case "agentBlocked":
-      return "blocked";
-    case "agentStopped":
-      return "stopped";
-    case "agentStart":
-      return "running";
-    default:
-      // toolStart, toolResult, agentMessage — no status change (keep running)
-      return "running";
-  }
-}
 
 router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promise<void> => {
   const rawToken = req.query.token ?? req.headers["x-notyfai-token"];
@@ -297,22 +272,15 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   const eventType = normalizeEventType(
     payload.hook_event_name ?? (req.headers["x-cursor-event"] as string)
   );
-  const semanticType = resolveSemanticType(eventType, payload);
-  const blocking = isBlockingEvent(semanticType);
-  const perm = payload.permission as string | undefined;
+  const semanticType = toSemanticType(eventType);
   const conversationId = payload.conversation_id as string | undefined;
 
-  // Log with clear BLOCKING vs NOT BLOCKING and reason
-  const blockingLabel = blocking ? "BLOCKING" : "NOT BLOCKING";
-  const reason = PERMISSION_BEARING_HOOKS.has(eventType as CursorEventType)
-    ? `eventType=${eventType} permission=${perm ?? "(undefined)"} → semanticType=${semanticType}`
-    : `eventType=${eventType} → semanticType=${semanticType}`;
   console.log(
-    "[hooks] %s | instanceId=%s userId=%s | %s",
-    blockingLabel,
+    "[hooks] instanceId=%s userId=%s | eventType=%s semanticType=%s",
     instanceId,
     instance.user_id,
-    reason
+    eventType,
+    semanticType
   );
 
   // ——— sessionStart: create a pending session slot (session_id from Cursor = one composer conversation)
@@ -382,6 +350,13 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
+  // Tab events (beforeTabFileRead, afterTabFileEdit): no reaction — do not store or update.
+  if (eventType === "beforeTabFileRead" || eventType === "afterTabFileEdit") {
+    console.log("[hooks] %s — tab event, no reaction", eventType);
+    res.status(202).json({ ok: true });
+    return;
+  }
+
   // ——— beforeSubmitPrompt: advance thread pending→running, insert agentStart ———
   if (eventType === "beforeSubmitPrompt") {
     const prompt =
@@ -421,6 +396,7 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
       .update({ last_event_at: new Date().toISOString() })
       .eq("id", instanceId);
 
+    scheduleBlockingCheck(executionId, instance.user_id, instance.name, eventType, payload);
     res.status(202).json({ ok: true });
     return;
   }
@@ -446,22 +422,48 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
-  let targetStatus = executionStatusForSemantic(semanticType);
-  // subagentStop is a sub-thread ending, not the main agent stop — never set execution to stopped
-  if (eventType === "subagentStop" && targetStatus === "stopped") {
-    targetStatus = "running";
-  }
-  // Blocking window: before* → status=blocked and set timer; after* or stop → clear timer
-  if (BEFORE_BLOCKING_HOOKS.has(eventType as CursorEventType)) {
-    targetStatus = "blocked";
-  } else if (AFTER_BLOCKING_HOOKS.has(eventType as CursorEventType)) {
-    targetStatus = "running";
-  }
+  // stop is handled here: cancel inactivity timer, mark stopped, send push
   if (eventType === "stop") {
-    targetStatus = "stopped";
-  }
-  if (targetStatus === "blocked") {
-    console.log("[hooks] execution status → blocked (before* window); push will be sent after debounce if permission ask/deny");
+    let executionId: string;
+    try {
+      const result = await upsertExecution(
+        instanceId, generationId, conversationId, "stopped", "running", conversationId
+      );
+      executionId = result.executionId;
+    } catch (err) {
+      console.error("[hooks] stop upsert failed:", err);
+      res.status(500).json({ error: "Failed to track execution" });
+      return;
+    }
+    cancelStaleBlockingTimeout(executionId);
+    await supabaseAdmin
+      .from("agent_executions")
+      .update({ blocked_since: null, blocking_event_type: null, blocking_tool_name: null })
+      .eq("id", executionId);
+    await supabaseAdmin.from("cursor_events").insert({
+      instance_id: instanceId,
+      execution_id: executionId,
+      event_type: eventType,
+      semantic_type: semanticType,
+      payload,
+    });
+    await supabaseAdmin
+      .from("cursor_instances")
+      .update({ last_event_at: new Date().toISOString() })
+      .eq("id", instanceId);
+    res.status(202).json({ ok: true });
+    const filters = instance.notification_filters;
+    if (filters !== null && !filters.includes(eventType) && !filters.includes(semanticType)) {
+      console.log("[hooks] notification suppressed by filter for event type: %s", eventType);
+      return;
+    }
+    const stopStatus = typeof payload.status === "string" ? payload.status : "";
+    if (stopStatus !== "aborted") {
+      sendPushNotification(instance.user_id, "agentStopped", payload, instance.name, executionId).catch((err) => {
+        console.error("[hooks] sendPushNotification error:", err);
+      });
+    }
+    return;
   }
 
   const model = typeof payload.model === "string" ? payload.model : undefined;
@@ -478,7 +480,7 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
       instanceId,
       generationId,
       conversationId,
-      targetStatus,
+      "running",
       "running",
       conversationId,
       Object.keys(metadata).length > 0 ? metadata : undefined
@@ -489,6 +491,13 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     res.status(500).json({ error: "Failed to track execution" });
     return;
   }
+
+  // Clear any stale blocking state — execution is active again
+  await supabaseAdmin
+    .from("agent_executions")
+    .update({ status: "running", blocked_since: null, blocking_event_type: null, blocking_tool_name: null })
+    .eq("id", executionId)
+    .neq("status", "stopped");
 
   const { error: insertError } = await supabaseAdmin.from("cursor_events").insert({
     instance_id: instanceId,
@@ -504,58 +513,6 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
-  // Blocking timer: set blocked_since on before*; clear on after* or stop
-  if (BEFORE_BLOCKING_HOOKS.has(eventType as CursorEventType)) {
-    const blockingToolName = blockingToolNameFromPayload(eventType as CursorEventType, payload);
-    await supabaseAdmin
-      .from("agent_executions")
-      .update({
-        blocked_since: new Date().toISOString(),
-        blocking_event_type: eventType,
-        blocking_tool_name: blockingToolName,
-      })
-      .eq("id", executionId);
-
-    // If not already permission-based blocking, treat long tool run (no after* in 5 min) as blocking
-    if (semanticType !== "agentBlocked") {
-      cancelStaleBlockingTimeout(executionId);
-      const timeout = setTimeout(async () => {
-        pendingStaleBlockingTimeouts.delete(executionId);
-        const { data: row } = await supabaseAdmin
-          .from("agent_executions")
-          .select("id, blocked_since, blocking_event_type, blocking_tool_name")
-          .eq("id", executionId)
-          .single();
-        if (row?.blocked_since) {
-          await supabaseAdmin.from("agent_executions").update({ status: "blocked" }).eq("id", executionId);
-          console.log("[hooks] tool run > 5 min with no follow-up → marking blocked and sending push executionId=%s", executionId);
-          const stalePayload: CursorHookPayload = {
-            ...payload,
-            hook_event_name: row.blocking_event_type,
-            tool_name: (row.blocking_tool_name ?? payload.tool_name) as string | undefined,
-            permission: "ask",
-          };
-          sendPushNotification(instance.user_id, "agentBlocked", stalePayload, instance.name, executionId).catch((err) => {
-            console.error("[hooks] sendPushNotification (stale blocking) error:", err);
-          });
-        }
-      }, TOOL_RUN_BLOCKING_THRESHOLD_MS);
-      pendingStaleBlockingTimeouts.set(executionId, timeout);
-    }
-  } else if (AFTER_BLOCKING_HOOKS.has(eventType as CursorEventType) || eventType === "stop") {
-    cancelStaleBlockingTimeout(executionId);
-    const clearUpdate: { blocked_since: null; blocking_event_type: null; blocking_tool_name: null; status?: string } = {
-      blocked_since: null,
-      blocking_event_type: null,
-      blocking_tool_name: null,
-    };
-    // After* ends the block and returns to running; stop is already set by upsertExecution
-    if (AFTER_BLOCKING_HOOKS.has(eventType as CursorEventType)) {
-      clearUpdate.status = "running";
-    }
-    await supabaseAdmin.from("agent_executions").update(clearUpdate).eq("id", executionId);
-  }
-
   await supabaseAdmin
     .from("cursor_instances")
     .update({ last_event_at: new Date().toISOString() })
@@ -563,29 +520,8 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
 
   res.status(202).json({ ok: true });
 
-  // Notification filter check
-  const filters = instance.notification_filters;
-  if (filters !== null && !filters.includes(eventType) && !filters.includes(semanticType)) {
-    console.log("[hooks] notification suppressed by filter for event type: %s", eventType);
-    return;
-  }
-
-  cancelPending(executionId);
-
-  if (semanticType === "agentStopped") {
-    sendPushNotification(instance.user_id, semanticType, payload, instance.name, executionId).catch((err) => {
-      console.error("[hooks] sendPushNotification error:", err);
-    });
-  } else if (semanticType === "agentBlocked") {
-    console.log("[hooks] BLOCKING: scheduling push notification in 15s for executionId=%s", executionId);
-    const timeout = setTimeout(() => {
-      pendingNotifications.delete(executionId);
-      sendPushNotification(instance.user_id, semanticType, payload, instance.name, executionId).catch((err) => {
-        console.error("[hooks] sendPushNotification (debounced) error:", err);
-      });
-    }, BLOCKING_PUSH_DEBOUNCE_MS);
-    pendingNotifications.set(executionId, timeout);
-  }
+  // Reset 3-min inactivity timer — if no further hook arrives, mark blocked and push
+  scheduleBlockingCheck(executionId, instance.user_id, instance.name, eventType, payload);
 });
 
 export default router;

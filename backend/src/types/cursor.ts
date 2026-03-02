@@ -44,9 +44,8 @@ export type SemanticEventType = (typeof SEMANTIC_EVENT_TYPES)[number];
 
 /**
  * Maps a raw Cursor event type to its default semantic type.
- * Permission-bearing hooks (before*Execution, beforeReadFile, beforeTabFileRead)
- * default to agentBlocked here; callers in hooks.ts use resolveSemanticType()
- * to treat only permission "ask" | "deny" as blocking, and "allow" | undefined as toolStart.
+ * before* hooks map to toolStart (start of a tool call).
+ * Blocking is determined purely by inactivity: if no hook fires for 3 min, the execution is marked blocked.
  * Only "stop" maps to agentStopped; eventType "unknown" is never treated as agentStopped.
  */
 export function toSemanticType(eventType: CursorEventType | "unknown"): SemanticEventType {
@@ -56,12 +55,11 @@ export function toSemanticType(eventType: CursorEventType | "unknown"): Semantic
       return "agentStart";
     case "subagentStart":
     case "preToolUse":
-      return "toolStart";
     case "beforeShellExecution":
     case "beforeMCPExecution":
     case "beforeReadFile":
     case "beforeTabFileRead":
-      return "agentBlocked";
+      return "toolStart";
     case "afterShellExecution":
     case "afterMCPExecution":
     case "postToolUse":
@@ -148,8 +146,7 @@ export interface CursorHookPayload {
   // beforeSubmitPrompt: user's initial message (agent description/title)
   prompt?: string;
 
-  // Permission-bearing hooks (beforeShellExecution, beforeMCPExecution,
-  // beforeReadFile, beforeTabFileRead)
+  // Permission field sent by before* hooks (not used for blocking logic)
   permission?: "allow" | "deny" | "ask";
   user_message?: string;
 
@@ -164,11 +161,3 @@ export function normalizeEventType(raw: string | undefined): CursorEventType | "
   const canonical = CURSOR_EVENT_TYPES.find((t) => t.toLowerCase() === raw.toLowerCase());
   return canonical ?? "unknown";
 }
-
-/** Set of permission-bearing hook types that require a permission check. */
-export const PERMISSION_BEARING_HOOKS = new Set<CursorEventType>([
-  "beforeShellExecution",
-  "beforeMCPExecution",
-  "beforeReadFile",
-  "beforeTabFileRead",
-]);
