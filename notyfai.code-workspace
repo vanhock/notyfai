@@ -5,6 +5,9 @@
 		},
 		{
 			"path": "../notyfaiapp"
+		},
+		{
+			"path": "../notyfai-cursor-plugin"
 		}
 	],
 	"settings": {}

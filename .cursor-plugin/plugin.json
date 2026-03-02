@@ -1,0 +1,12 @@
+{
+  "name": "notyfai",
+  "version": "1.0.0",
+  "description": "Open source solution for quick hooks setup for agent status notifications",
+  "author": { "name": "Notyfai" },
+  "homepage": "https://notyfai.com",
+  "repository": "https://github.com/notyfai/notyfai",
+  "license": "MIT",
+  "keywords": ["hooks", "notifications", "push", "agent", "mobile", "monitoring"],
+  "logo": "assets/logo.svg",
+  "hooks": "hooks/hooks.json"
+}

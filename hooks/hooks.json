@@ -1,0 +1,21 @@
+{
+  "hooks": {
+    "sessionStart": [{ "command": "./scripts/notyfai-send.sh" }],
+    "sessionEnd": [{ "command": "./scripts/notyfai-send.sh" }],
+    "beforeSubmitPrompt": [{ "command": "./scripts/notyfai-send.sh" }],
+    "afterAgentResponse": [{ "command": "./scripts/notyfai-send.sh" }],
+    "beforeReadFile": [{ "command": "./scripts/notyfai-send.sh" }],
+    "beforeTabFileRead": [{ "command": "./scripts/notyfai-send.sh" }],
+    "afterFileEdit": [{ "command": "./scripts/notyfai-send.sh" }],
+    "beforeShellExecution": [{ "command": "./scripts/notyfai-send.sh" }],
+    "afterShellExecution": [{ "command": "./scripts/notyfai-send.sh" }],
+    "beforeMCPExecution": [{ "command": "./scripts/notyfai-send.sh" }],
+    "afterMCPExecution": [{ "command": "./scripts/notyfai-send.sh" }],
+    "preToolUse": [{ "command": "./scripts/notyfai-send.sh" }],
+    "postToolUse": [{ "command": "./scripts/notyfai-send.sh" }],
+    "postToolUseFailure": [{ "command": "./scripts/notyfai-send.sh" }],
+    "subagentStart": [{ "command": "./scripts/notyfai-send.sh" }],
+    "subagentStop": [{ "command": "./scripts/notyfai-send.sh" }],
+    "stop": [{ "command": "./scripts/notyfai-send.sh" }]
+  }
+}
