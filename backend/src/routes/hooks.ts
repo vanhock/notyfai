@@ -45,6 +45,27 @@ const hookRateLimit = rateLimit({
 /** If no hook activity for this long, treat execution as blocking and notify. */
 const TOOL_RUN_BLOCKING_THRESHOLD_MS = 3 * 60 * 1000;
 
+/**
+ * Event types that count as "activity" for the blocking timer.
+ * Only these events reset the 3-min inactivity timer; other events are ignored for blocking.
+ * Should align with the hooks you send from Cursor (e.g. .cursor/hooks.json).
+ */
+const BLOCKING_ACTIVITY_EVENT_TYPES = new Set<CursorEventType | "unknown">([
+  "beforeSubmitPrompt",
+  "afterAgentResponse",
+  "beforeShellExecution",
+  "afterShellExecution",
+  "beforeMCPExecution",
+  "afterMCPExecution",
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+]);
+
+function isBlockingActivityEvent(eventType: CursorEventType | "unknown"): boolean {
+  return BLOCKING_ACTIVITY_EVENT_TYPES.has(eventType);
+}
+
 /** Keyed by execution_id — latest event context stored for the inactivity timer. */
 const pendingBlockInfo = new Map<string, { eventType: string; toolName: string | null; payload: CursorHookPayload }>();
 
@@ -379,7 +400,9 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
       .update({ last_event_at: new Date().toISOString() })
       .eq("id", instanceId);
 
-    scheduleBlockingCheck(executionId, instance.user_id, instanceId, instance.name, eventType, payload);
+    if (isBlockingActivityEvent(eventType)) {
+      scheduleBlockingCheck(executionId, instance.user_id, instanceId, instance.name, eventType, payload);
+    }
     res.status(202).json({ ok: true });
     return;
   }
@@ -503,8 +526,10 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
 
   res.status(202).json({ ok: true });
 
-  // Reset 3-min inactivity timer — if no further hook arrives, mark blocked and push
-  scheduleBlockingCheck(executionId, instance.user_id, instanceId, instance.name, eventType, payload);
+  // Reset 3-min inactivity timer only for configured blocking-activity events
+  if (isBlockingActivityEvent(eventType)) {
+    scheduleBlockingCheck(executionId, instance.user_id, instanceId, instance.name, eventType, payload);
+  }
 });
 
 export default router;
