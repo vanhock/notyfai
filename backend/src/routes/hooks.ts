@@ -42,21 +42,6 @@ const hookRateLimit = rateLimit({
   legacyHeaders: false,
 });
 
-const requestCounts = new Map<string, { count: number; windowStart: number }>();
-const ABUSE_WINDOW_MS = 60 * 60 * 1000;
-const ABUSE_THRESHOLD = 500;
-
-function trackAndCheckAbuse(instanceId: string): boolean {
-  const now = Date.now();
-  const entry = requestCounts.get(instanceId);
-  if (!entry || now - entry.windowStart > ABUSE_WINDOW_MS) {
-    requestCounts.set(instanceId, { count: 1, windowStart: now });
-    return false;
-  }
-  entry.count += 1;
-  return entry.count > ABUSE_THRESHOLD;
-}
-
 /** If no hook activity for this long, treat execution as blocking and notify. */
 const TOOL_RUN_BLOCKING_THRESHOLD_MS = 3 * 60 * 1000;
 
@@ -254,19 +239,6 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   if (tokenVersion !== instance.token_version) {
     console.warn("[hooks] stale token version (token=%d db=%d)", tokenVersion, instance.token_version);
     res.status(401).json({ error: "Token has been rotated. Please update your hook URL." });
-    return;
-  }
-
-  if (trackAndCheckAbuse(instanceId)) {
-    console.warn("[hooks] auto-revoking instance %s (abuse threshold exceeded)", instanceId);
-    await supabaseAdmin.from("cursor_instances").update({ revoked: true }).eq("id", instanceId);
-    sendPushNotification(
-      instance.user_id,
-      "agentStopped",
-      { status: "error", hook_event_name: "stop" },
-      `Security alert: hook URL for "${instance.name ?? instanceId.slice(0, 8)}" disabled due to suspicious activity.`
-    ).catch(() => {});
-    res.status(429).json({ error: "Instance auto-revoked due to excessive requests." });
     return;
   }
 
