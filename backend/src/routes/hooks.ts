@@ -106,25 +106,28 @@ function scheduleBlockingCheck(
     pendingStaleBlockingTimeouts.delete(executionId);
     const info = pendingBlockInfo.get(executionId);
     pendingBlockInfo.delete(executionId);
-    const { data: row } = await supabaseAdmin
-      .from("agent_executions")
-      .select("id, status")
-      .eq("id", executionId)
-      .single();
-    if (!row || row.status === "stopped") return;
-    await supabaseAdmin
-      .from("agent_executions")
-      .update({
-        status: "blocked",
-        blocked_since: new Date().toISOString(),
-        blocking_event_type: info?.eventType ?? null,
-        blocking_tool_name: info?.toolName ?? null,
-      })
-      .eq("id", executionId);
-    console.log("[hooks] no hook activity for 3 min → marking blocked executionId=%s", executionId);
+    // Always send push when timer fires (3 min of silence = noteworthy regardless of stop race)
     sendPushNotification(userId, "agentBlocked", info?.payload ?? payload, instanceName, executionId).catch((err) => {
       console.error("[hooks] sendPushNotification (inactivity) error:", err);
     });
+    // Update DB only if not already stopped
+    const { data: row } = await supabaseAdmin
+      .from("agent_executions")
+      .select("status")
+      .eq("id", executionId)
+      .single();
+    if (row && row.status !== "stopped") {
+      await supabaseAdmin
+        .from("agent_executions")
+        .update({
+          status: "blocked",
+          blocked_since: new Date().toISOString(),
+          blocking_event_type: info?.eventType ?? null,
+          blocking_tool_name: info?.toolName ?? null,
+        })
+        .eq("id", executionId);
+      console.log("[hooks] no hook activity for 3 min → marking blocked executionId=%s", executionId);
+    }
   }, TOOL_RUN_BLOCKING_THRESHOLD_MS);
   pendingStaleBlockingTimeouts.set(executionId, timeout);
 }

@@ -104,6 +104,10 @@ export interface CursorHookPayload {
   agent_message?: string;
   is_error?: boolean;
   tool_use_result?: string;
+  // postToolUseFailure
+  failure_type?: "error" | "timeout" | "permission_denied";
+  is_interrupt?: boolean;
+  tool_output?: string;
 
   // beforeShellExecution / afterShellExecution
   command?: string;

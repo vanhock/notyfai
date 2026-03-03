@@ -9,17 +9,6 @@ function truncate(str: string, max: number): string {
   return str.length <= max ? str : `${str.slice(0, max - 1)}…`;
 }
 
-function getMcpServer(payload: CursorHookPayload): string {
-  const urlOrCmd = (payload.url ?? payload.command) as string | undefined;
-  if (!urlOrCmd) return "";
-  // For URL-based servers show just the host; for command-based show the binary name
-  try {
-    return new URL(urlOrCmd).host;
-  } catch {
-    return urlOrCmd.split(/[\s/\\]/).find(Boolean) ?? urlOrCmd;
-  }
-}
-
 function getNotificationContent(
   semanticType: SemanticEventType,
   payload: CursorHookPayload,
@@ -33,16 +22,11 @@ function getNotificationContent(
 
   switch (semanticType) {
     case "agentBlocked": {
-      if (payload.hook_event_name === "beforeMCPExecution" || payload.tool_name) {
-        const tool = (payload.tool_name as string | undefined) ?? "MCP tool";
-        const server = getMcpServer(payload);
-        title = `Awaiting: ${tool}`;
-        body = server ? `${server} — ${name}` : name;
-      } else {
-        const cmd = typeof payload.command === "string" ? payload.command : "";
-        title = "Awaiting shell action";
-        body = cmd ? `${truncate(cmd, 60)} — ${name}` : name;
-      }
+      title = "Agent waiting";
+      const toolName = payload.tool_name as string | undefined;
+      const cmd = typeof payload.command === "string" ? payload.command : undefined;
+      const context = toolName ?? (cmd ? truncate(cmd, 40) : null) ?? "tool";
+      body = `${context} — ${name}`;
       break;
     }
 
