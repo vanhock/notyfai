@@ -48,8 +48,9 @@ function getNotificationContent(
       body = name;
   }
 
-  // Use original prompt as notification title when available (thread title)
-  if (prompt != null && prompt.trim() !== "") {
+  // Use original prompt as notification title when available (thread title).
+  // Skip for agentBlocked so the title stays "Agent waiting" instead of user message text.
+  if (semanticType !== "agentBlocked" && prompt != null && prompt.trim() !== "") {
     return { title: truncate(prompt.trim(), 80), body };
   }
   return { title, body };
@@ -66,6 +67,7 @@ export async function sendPushNotification(
   semanticType: SemanticEventType,
   payload: CursorHookPayload,
   instanceName: string | null,
+  instanceId: string,
   executionId?: string
 ): Promise<void> {
   const throttleKey = executionId ?? userId;
@@ -109,13 +111,21 @@ export async function sendPushNotification(
   await Promise.allSettled(
     tokens.map(async ({ id, token, platform }: { id: string; token: string; platform: string }) => {
       try {
+        const data: Record<string, string> = { instance_id: instanceId };
+        if (executionId) data.execution_id = executionId;
+
         await messaging.send({
           token,
           notification: { title, body },
-          data: executionId ? { execution_id: executionId } : undefined,
+          data,
           apns: {
-            headers: executionId ? { "apns-thread-id": executionId } : undefined,
-            payload: { aps: { sound: "default" } },
+            headers: { "apns-thread-id": instanceId },
+            payload: {
+              aps: {
+                sound: "default",
+                "summary-arg": instanceName ?? "Cursor",
+              },
+            },
           },
           android: {
             notification: {

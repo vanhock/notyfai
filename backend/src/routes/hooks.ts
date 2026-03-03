@@ -80,6 +80,7 @@ function blockingToolNameFromPayload(
 function scheduleBlockingCheck(
   executionId: string,
   userId: string,
+  instanceId: string,
   instanceName: string | null,
   eventType: CursorEventType | "unknown",
   payload: CursorHookPayload
@@ -92,7 +93,7 @@ function scheduleBlockingCheck(
     const info = pendingBlockInfo.get(executionId);
     pendingBlockInfo.delete(executionId);
     // Always send push when timer fires (3 min of silence = noteworthy regardless of stop race)
-    sendPushNotification(userId, "agentBlocked", info?.payload ?? payload, instanceName, executionId).catch((err) => {
+    sendPushNotification(userId, "agentBlocked", info?.payload ?? payload, instanceName, instanceId, executionId).catch((err) => {
       console.error("[hooks] sendPushNotification (inactivity) error:", err);
     });
     // Update DB only if not already stopped
@@ -244,9 +245,16 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
 
   const body = req.body as CursorHookPayload | undefined;
   const payload = body && typeof body === "object" ? body : ({} as CursorHookPayload);
-  const eventType = normalizeEventType(
-    payload.hook_event_name ?? (req.headers["x-cursor-event"] as string)
-  );
+  const rawEventName = (payload.hook_event_name ?? req.headers["x-cursor-event"]) as string | undefined;
+  if (
+    rawEventName === "beforeReadFile" ||
+    rawEventName === "beforeTabFileRead" ||
+    rawEventName === "afterFileEdit"
+  ) {
+    res.status(202).json({ ok: true });
+    return;
+  }
+  const eventType = normalizeEventType(rawEventName);
   const semanticType = toSemanticType(eventType);
   const conversationId = payload.conversation_id as string | undefined;
 
@@ -325,8 +333,8 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
-  // Tab events (beforeTabFileRead, afterTabFileEdit): no reaction — do not store or update.
-  if (eventType === "beforeTabFileRead" || eventType === "afterTabFileEdit") {
+  // Tab events (afterTabFileEdit): no reaction — do not store or update.
+  if (eventType === "afterTabFileEdit") {
     console.log("[hooks] %s — tab event, no reaction", eventType);
     res.status(202).json({ ok: true });
     return;
@@ -371,7 +379,7 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
       .update({ last_event_at: new Date().toISOString() })
       .eq("id", instanceId);
 
-    scheduleBlockingCheck(executionId, instance.user_id, instance.name, eventType, payload);
+    scheduleBlockingCheck(executionId, instance.user_id, instanceId, instance.name, eventType, payload);
     res.status(202).json({ ok: true });
     return;
   }
@@ -434,7 +442,7 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     }
     const stopStatus = typeof payload.status === "string" ? payload.status : "";
     if (stopStatus !== "aborted") {
-      sendPushNotification(instance.user_id, "agentStopped", payload, instance.name, executionId).catch((err) => {
+      sendPushNotification(instance.user_id, "agentStopped", payload, instance.name, instanceId, executionId).catch((err) => {
         console.error("[hooks] sendPushNotification error:", err);
       });
     }
@@ -496,7 +504,7 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   res.status(202).json({ ok: true });
 
   // Reset 3-min inactivity timer — if no further hook arrives, mark blocked and push
-  scheduleBlockingCheck(executionId, instance.user_id, instance.name, eventType, payload);
+  scheduleBlockingCheck(executionId, instance.user_id, instanceId, instance.name, eventType, payload);
 });
 
 export default router;

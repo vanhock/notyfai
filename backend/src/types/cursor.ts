@@ -2,9 +2,9 @@
  * All Cursor hook event types from https://cursor.com/docs/agent/hooks
  * (Agent: sessionStart, sessionEnd, preToolUse, postToolUse, postToolUseFailure,
  *  subagentStart, subagentStop, beforeShellExecution, afterShellExecution,
- *  beforeMCPExecution, afterMCPExecution, beforeReadFile, afterFileEdit,
+ *  beforeMCPExecution, afterMCPExecution,
  *  beforeSubmitPrompt, preCompact, stop, afterAgentResponse, afterAgentThought;
- *  Tab: beforeTabFileRead, afterTabFileEdit)
+ *  Tab: afterTabFileEdit)
  */
 export const CURSOR_EVENT_TYPES = [
   "sessionStart",
@@ -15,9 +15,6 @@ export const CURSOR_EVENT_TYPES = [
   "preToolUse",
   "postToolUse",
   "postToolUseFailure",
-  "beforeReadFile",
-  "afterFileEdit",
-  "beforeTabFileRead",
   "afterTabFileEdit",
   "beforeShellExecution",
   "afterShellExecution",
@@ -57,15 +54,12 @@ export function toSemanticType(eventType: CursorEventType | "unknown"): Semantic
     case "preToolUse":
     case "beforeShellExecution":
     case "beforeMCPExecution":
-    case "beforeReadFile":
-    case "beforeTabFileRead":
       return "toolStart";
     case "afterShellExecution":
     case "afterMCPExecution":
     case "postToolUse":
     case "postToolUseFailure":
     case "subagentStop":
-    case "afterFileEdit":
     case "afterTabFileEdit":
     case "preCompact":
       return "toolResult";
@@ -121,7 +115,7 @@ export interface CursorHookPayload {
   url?: string;
   result_json?: string;
 
-  // beforeReadFile / beforeTabFileRead / afterFileEdit / afterTabFileEdit
+  // afterTabFileEdit
   file_path?: string;
   edits?: Array<{ old_string?: string; new_string?: string; range?: unknown }>;
 

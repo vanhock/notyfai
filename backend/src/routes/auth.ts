@@ -3,6 +3,39 @@ import { getSupabaseAuth } from "../lib/supabase.js";
 
 const router = Router();
 
+const SUPABASE_URL = process.env.SUPABASE_URL?.replace(/\/$/, "") ?? "";
+
+/**
+ * GET /api/auth/verify
+ * Query: token, type (e.g. signup), redirect_to (optional)
+ * Redirects the browser to Supabase's verify endpoint so email confirmation links
+ * can point at this backend. Supabase then verifies and redirects the user to redirect_to.
+ * Use this URL in your Supabase email template if you want the link to hit your backend first.
+ */
+router.get("/verify", (req: Request, res: Response): void => {
+  const token = typeof req.query.token === "string" ? req.query.token : "";
+  const type = typeof req.query.type === "string" ? req.query.type : "signup";
+  const redirectTo = typeof req.query.redirect_to === "string" ? req.query.redirect_to : "";
+
+  if (!token) {
+    res.status(400).json({ error: "token is required" });
+    return;
+  }
+  if (!SUPABASE_URL) {
+    res.status(500).json({ error: "Server misconfiguration: SUPABASE_URL not set" });
+    return;
+  }
+
+  const verifyUrl = new URL("/auth/v1/verify", SUPABASE_URL);
+  verifyUrl.searchParams.set("token", token);
+  verifyUrl.searchParams.set("type", type);
+  if (redirectTo) {
+    verifyUrl.searchParams.set("redirect_to", redirectTo);
+  }
+
+  res.redirect(302, verifyUrl.toString());
+});
+
 /**
  * POST /api/auth/signup
  * Request body: { email: string, password: string }
