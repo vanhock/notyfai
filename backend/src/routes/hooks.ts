@@ -278,14 +278,74 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   const eventType = normalizeEventType(rawEventName);
   const semanticType = toSemanticType(eventType);
   const conversationId = payload.conversation_id as string | undefined;
+  const generationId = payload.generation_id as string | undefined;
 
   console.log(
-    "[hooks] instanceId=%s userId=%s | eventType=%s semanticType=%s",
+    "[hooks] instanceId=%s userId=%s | eventType=%s semanticType=%s | conv=%s gen=%s",
     instanceId,
     instance.user_id,
     eventType,
-    semanticType
+    semanticType,
+    conversationId ?? "(none)",
+    generationId ?? "(none)"
   );
+
+  // ——— subagentStart / subagentStop or tool events: associate with parent, don't create new row ———
+  const isSubagentOrToolEvent = [
+    "subagentStart",
+    "subagentStop",
+    "preToolUse",
+    "postToolUse",
+    "postToolUseFailure",
+    "beforeShellExecution",
+    "afterShellExecution",
+    "beforeMCPExecution",
+    "afterMCPExecution",
+    "afterAgentThought",
+  ].includes(eventType);
+
+  if (isSubagentOrToolEvent) {
+    // Find the most recently updated active execution for this instance
+    const { data: parentExec } = await supabaseAdmin
+      .from("agent_executions")
+      .select("id")
+      .eq("instance_id", instanceId)
+      .in("status", ["running", "blocked"])
+      .order("updated_at", { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (parentExec) {
+      console.log("[hooks] associating %s with parent executionId=%s", eventType, parentExec.id);
+      
+      await supabaseAdmin.from("cursor_events").insert({
+        instance_id: instanceId,
+        execution_id: parentExec.id,
+        event_type: eventType,
+        semantic_type: semanticType,
+        payload,
+      });
+
+      await supabaseAdmin
+        .from("cursor_instances")
+        .update({ last_event_at: new Date().toISOString() })
+        .eq("id", instanceId);
+
+      res.status(202).json({ ok: true });
+      return;
+    } else {
+      console.log("[hooks] %s: no active parent found — storing as orphan", eventType);
+      await supabaseAdmin.from("cursor_events").insert({
+        instance_id: instanceId,
+        execution_id: null,
+        event_type: eventType,
+        semantic_type: semanticType,
+        payload,
+      });
+      res.status(202).json({ ok: true });
+      return;
+    }
+  }
 
   // ——— sessionStart: create a pending session slot (session_id from Cursor = one composer conversation)
   if (eventType === "sessionStart") {
@@ -339,7 +399,6 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   }
 
   // ——— All other events require generation_id to associate with a thread ———
-  const generationId = payload.generation_id as string | undefined;
 
   if (!generationId) {
     console.warn("[hooks] %s missing generation_id — storing orphan event", eventType);
