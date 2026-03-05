@@ -22,9 +22,12 @@ type HookInstance = {
   notification_filters: string[] | null;
 };
 
+const HOOK_RATE_LIMIT_WINDOW_MS = 10 * 60 * 1000;
+const HOOK_RATE_LIMIT_MAX = 2000;
+
 const hookRateLimit = rateLimit({
-  windowMs: 10 * 60 * 1000,
-  max: 400,
+  windowMs: HOOK_RATE_LIMIT_WINDOW_MS,
+  max: HOOK_RATE_LIMIT_MAX,
   keyGenerator: (req) => {
     const rawToken = req.query.token ?? req.headers["x-notyfai-token"];
     const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
@@ -34,9 +37,26 @@ const hookRateLimit = rateLimit({
     }
     return ipKeyGenerator(req.ip ?? "0.0.0.0");
   },
-  handler: (_req, res) => {
-    console.warn("[hooks] rate limit exceeded");
-    res.status(429).json({ error: "Too many requests. Slow down." });
+  handler: (req, res) => {
+    const rawToken = req.query.token ?? req.headers["x-notyfai-token"];
+    const token = Array.isArray(rawToken) ? rawToken[0] : rawToken;
+    let key = "ip:" + (req.ip ?? "0.0.0.0");
+    if (token && typeof token === "string") {
+      const verified = verifyAndGetInstanceId(token);
+      if (verified) key = `instance:${verified.instanceId}`;
+    }
+    const windowMin = HOOK_RATE_LIMIT_WINDOW_MS / 60000;
+    console.warn(
+      "[hooks] RATE LIMIT EXCEEDED | key=%s | limit=%d requests per %d min | window resets in ~%d min, then requests will be accepted again",
+      key,
+      HOOK_RATE_LIMIT_MAX,
+      windowMin,
+      windowMin
+    );
+    res.status(429).json({
+      error: "Too many requests. Slow down.",
+      retry_after_minutes: windowMin,
+    });
   },
   standardHeaders: true,
   legacyHeaders: false,
