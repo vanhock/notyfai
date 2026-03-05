@@ -126,37 +126,81 @@ async function scheduleBlockingCheck(
 
 type ExecutionMetadata = {
   prompt?: string;
-  model?: string;
-  workspace_roots?: string[] | null;
 };
 
 /**
- * Upsert an agent_execution row for (instance_id, generation_id).
- * sessionId (Cursor session_id, same as conversation_id) groups all turns in one composer conversation.
- * Returns { executionId, isNew }.
- * initialStatus is only used on INSERT; existing rows advance forward-only.
- * metadata: prompt/model/workspace_roots stored on INSERT; on UPDATE, only backfill null columns.
+ * Upsert a thread row for (instance_id, conversation_id).
+ * Returns thread id.
+ */
+async function upsertThread(
+  instanceId: string,
+  conversationId: string,
+  updates?: { status?: string; prompt?: string; session_ended_at?: string }
+): Promise<string> {
+  const now = new Date().toISOString();
+  const insertRow = {
+    instance_id: instanceId,
+    conversation_id: conversationId,
+    status: updates?.status ?? "pending",
+    prompt: updates?.prompt ?? null,
+    session_ended_at: updates?.session_ended_at ?? null,
+    started_at: now,
+    updated_at: now,
+  };
+
+  const { data: inserted, error: insertError } = await supabaseAdmin
+    .from("threads")
+    .insert(insertRow)
+    .select("id")
+    .single();
+
+  if (!insertError && inserted) {
+    return inserted.id as string;
+  }
+
+  // Conflict: update existing thread
+  const { data: existing, error: selectError } = await supabaseAdmin
+    .from("threads")
+    .select("id, status")
+    .eq("conversation_id", conversationId)
+    .single();
+
+  if (selectError || !existing) {
+    throw new Error(`[hooks] failed to upsert thread: ${selectError?.message ?? "unknown"}`);
+  }
+
+  const threadId = existing.id as string;
+  const rank: Record<string, number> = { pending: 0, running: 1, blocked: 2, stopped: 3 };
+  const threadUpdates: Record<string, unknown> = { updated_at: now };
+  if (updates?.status != null && (rank[updates.status] ?? -1) >= (rank[(existing.status as string) ?? ""] ?? -1)) {
+    threadUpdates.status = updates.status;
+  }
+  if (updates?.prompt != null) threadUpdates.prompt = updates.prompt;
+  if (updates?.session_ended_at !== undefined) threadUpdates.session_ended_at = updates.session_ended_at;
+
+  await supabaseAdmin.from("threads").update(threadUpdates).eq("id", threadId);
+  return threadId;
+}
+
+/**
+ * Upsert an agent_execution row for (thread_id, generation_id).
+ * Returns { executionId, isNew, threadId }.
+ * After execution status change, call updateThreadStatus to sync thread.status.
  */
 async function upsertExecution(
+  threadId: string,
   instanceId: string,
   generationId: string,
-  conversationId: string | undefined,
   status: string,
   initialStatus: string = "running",
-  sessionId?: string,
   metadata?: ExecutionMetadata
-): Promise<{ executionId: string; isNew: boolean }> {
-  const effectiveSessionId = sessionId ?? conversationId ?? null;
+): Promise<{ executionId: string; isNew: boolean; threadId: string }> {
+  const now = new Date().toISOString();
   const insertRow: Record<string, unknown> = {
+    thread_id: threadId,
     instance_id: instanceId,
     generation_id: generationId,
-    conversation_id: conversationId ?? null,
-    session_id: effectiveSessionId,
-    status: initialStatus,
   };
-  if (metadata?.prompt !== undefined) insertRow.prompt = metadata.prompt;
-  if (metadata?.model !== undefined) insertRow.model = metadata.model;
-  if (metadata?.workspace_roots !== undefined) insertRow.workspace_roots = metadata.workspace_roots;
 
   const { data: inserted, error: insertError } = await supabaseAdmin
     .from("agent_executions")
@@ -165,13 +209,13 @@ async function upsertExecution(
     .single();
 
   if (!insertError && inserted) {
-    return { executionId: inserted.id as string, isNew: true };
+    return { executionId: inserted.id as string, isNew: true, threadId };
   }
 
   const { data: existing, error: fetchError } = await supabaseAdmin
     .from("agent_executions")
-    .select("id, status, prompt, model, workspace_roots")
-    .eq("instance_id", instanceId)
+    .select("id")
+    .eq("thread_id", threadId)
     .eq("generation_id", generationId)
     .single();
 
@@ -179,33 +223,9 @@ async function upsertExecution(
     throw new Error(`[hooks] failed to upsert execution: ${fetchError?.message ?? "unknown"}`);
   }
 
-  const executionId = existing.id as string;
-
-  // Forward-only: pending(0) → running(1) → stopped(2); blocked is a temporary state, not ranked
-  const rank: Record<string, number> = { pending: 0, running: 1, stopped: 2 };
-  const updates: {
-    status?: string;
-    updated_at: string;
-    session_id?: string | null;
-    model?: string;
-    workspace_roots?: string[] | null;
-  } = {
-    updated_at: new Date().toISOString(),
-  };
-  if (effectiveSessionId !== null) updates.session_id = effectiveSessionId;
-  if ((rank[status] ?? -1) > (rank[existing.status as string] ?? -1)) {
-    updates.status = status;
-  }
-  // Backfill metadata only when still null
-  if (metadata?.model != null && existing.model == null) updates.model = metadata.model;
-  if (metadata?.workspace_roots != null && existing.workspace_roots == null) {
-    updates.workspace_roots = metadata.workspace_roots;
-  }
-  await supabaseAdmin.from("agent_executions").update(updates).eq("id", executionId);
-
-  return { executionId, isNew: false };
+  await supabaseAdmin.from("agent_executions").update({ updated_at: now }).eq("id", existing.id);
+  return { executionId: existing.id as string, isNew: false, threadId };
 }
-
 
 router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promise<void> => {
   const rawToken = req.query.token ?? req.headers["x-notyfai-token"];
@@ -290,17 +310,34 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   ].includes(eventType);
 
   if (isSubagentOrToolEvent) {
-    // Find the most recently updated active execution for this instance
+    // Find active threads (running/blocked), then most recent execution
+    const { data: activeThreads } = await supabaseAdmin
+      .from("threads")
+      .select("id")
+      .eq("instance_id", instanceId)
+      .in("status", ["running", "blocked"]);
+    const threadIds = (activeThreads ?? []).map((t: { id: string }) => t.id);
+    if (threadIds.length === 0) {
+      console.log("[hooks] %s: no active parent found — storing as orphan", eventType);
+      await supabaseAdmin.from("cursor_events").insert({
+        instance_id: instanceId,
+        execution_id: null,
+        event_type: eventType,
+        semantic_type: semanticType,
+        payload,
+      });
+      res.status(202).json({ ok: true });
+      return;
+    }
     const { data: parentExec } = await supabaseAdmin
       .from("agent_executions")
       .select("id")
-      .eq("instance_id", instanceId)
-      .in("status", ["running", "blocked"])
+      .in("thread_id", threadIds)
       .order("updated_at", { ascending: false })
       .limit(1)
       .maybeSingle();
 
-    if (parentExec) {
+    if (parentExec != null) {
       console.log("[hooks] associating %s with parent executionId=%s", eventType, parentExec.id);
       
       await supabaseAdmin.from("cursor_events").insert({
@@ -336,7 +373,7 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     }
   }
 
-  // ——— sessionStart: create a pending session slot (session_id from Cursor = one composer conversation)
+  // ——— sessionStart: create a pending thread and placeholder execution
   if (eventType === "sessionStart") {
     const sessionId = payload.session_id as string | undefined;
     if (!sessionId) {
@@ -344,16 +381,9 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
       res.status(202).json({ ok: true });
       return;
     }
-    // One row per session: generation_id = session_id so (instance_id, generation_id) is unique
     try {
-      await upsertExecution(
-        instanceId,
-        sessionId,
-        sessionId,
-        "pending",
-        "pending",
-        sessionId
-      );
+      const threadId = await upsertThread(instanceId, sessionId, { status: "pending" });
+      await upsertExecution(threadId, instanceId, sessionId, "pending", "pending");
     } catch (err) {
       console.error("[hooks] sessionStart upsert failed:", err);
       res.status(500).json({ error: "Failed to track execution" });
@@ -369,15 +399,15 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
-  // ——— sessionEnd: mark all executions in this session as ended ———
+  // ——— sessionEnd: mark thread as ended ———
   if (eventType === "sessionEnd") {
     const sessionId = payload.session_id as string | undefined;
     if (sessionId) {
       await supabaseAdmin
-        .from("agent_executions")
+        .from("threads")
         .update({ session_ended_at: new Date().toISOString() })
         .eq("instance_id", instanceId)
-        .eq("session_id", sessionId);
+        .eq("conversation_id", sessionId);
     }
     await supabaseAdmin
       .from("cursor_instances")
@@ -413,21 +443,21 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
   if (eventType === "beforeSubmitPrompt") {
     const prompt =
       typeof payload.prompt === "string" ? payload.prompt : undefined;
-    const model = typeof payload.model === "string" ? payload.model : undefined;
-    const workspaceRoots = Array.isArray(payload.workspace_roots)
-      ? payload.workspace_roots
-      : undefined;
+    const conversationKey = conversationId ?? generationId;
+    if (!conversationKey) {
+      console.warn("[hooks] beforeSubmitPrompt missing conversation_id/generation_id — skipping");
+      res.status(202).json({ ok: true });
+      return;
+    }
     let executionId: string;
     try {
-      const result = await upsertExecution(
-        instanceId,
-        generationId,
-        conversationId,
-        "running",
-        "running",
-        conversationId,
-        { prompt, model, workspace_roots: workspaceRoots }
-      );
+      const threadId = await upsertThread(instanceId, conversationKey, {
+        status: "running",
+        prompt: prompt ?? undefined,
+      });
+      const result = await upsertExecution(threadId, instanceId, generationId, "running", "running", {
+        prompt,
+      });
       executionId = result.executionId;
     } catch (err) {
       console.error("[hooks] beforeSubmitPrompt upsert failed:", err);
@@ -476,13 +506,13 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
-  // stop is handled here: cancel inactivity timer, mark stopped, send push
+  // stop is handled here: cancel inactivity timer, mark thread stopped, send push
   if (eventType === "stop") {
     let executionId: string;
+    let threadId: string;
     try {
-      const result = await upsertExecution(
-        instanceId, generationId, conversationId, "stopped", "running", conversationId
-      );
+      threadId = await upsertThread(instanceId, conversationId, { status: "stopped" });
+      const result = await upsertExecution(threadId, instanceId, generationId, "stopped", "running");
       executionId = result.executionId;
     } catch (err) {
       console.error("[hooks] stop upsert failed:", err);
@@ -521,32 +551,17 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     const isAborted =
       stopStatus.toLowerCase() === "aborted" || finalStatus.toLowerCase() === "aborted";
     if (!isAborted) {
-      sendPushNotification(instance.user_id, "agentStopped", payload, instance.name, instanceId, executionId).catch((err) => {
+      sendPushNotification(instance.user_id, "agentStopped", payload, instance.name, instanceId, executionId, threadId).catch((err) => {
         console.error("[hooks] sendPushNotification error:", err);
       });
     }
     return;
   }
 
-  const model = typeof payload.model === "string" ? payload.model : undefined;
-  const workspaceRoots = Array.isArray(payload.workspace_roots)
-    ? payload.workspace_roots
-    : undefined;
-  const metadata: ExecutionMetadata = {};
-  if (model != null) metadata.model = model;
-  if (workspaceRoots != null) metadata.workspace_roots = workspaceRoots;
-
   let executionId: string;
   try {
-    const result = await upsertExecution(
-      instanceId,
-      generationId,
-      conversationId,
-      "running",
-      "running",
-      conversationId,
-      Object.keys(metadata).length > 0 ? metadata : undefined
-    );
+    const threadId = await upsertThread(instanceId, conversationId, { status: "running" });
+    const result = await upsertExecution(threadId, instanceId, generationId, "running", "running");
     executionId = result.executionId;
   } catch (err) {
     console.error("[hooks] execution upsert failed:", err);
@@ -554,19 +569,17 @@ router.post("/cursor", hookRateLimit, async (req: Request, res: Response): Promi
     return;
   }
 
-  // Clear any stale blocking state — execution is active again
+  // Clear any stale blocking state on execution; thread status already set to running
   await supabaseAdmin
     .from("agent_executions")
     .update({
-      status: "running",
       blocked_since: null,
       blocking_event_type: null,
       blocking_tool_name: null,
       blocking_check_at: null,
       blocking_payload: null,
     })
-    .eq("id", executionId)
-    .neq("status", "stopped");
+    .eq("id", executionId);
 
   const { error: insertError } = await supabaseAdmin.from("cursor_events").insert({
     instance_id: instanceId,

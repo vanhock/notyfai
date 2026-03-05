@@ -7,7 +7,8 @@ const router = Router();
 /**
  * GET /api/executions
  * Query params: instance_id?, limit? (default 20), offset? (default 0)
- * Returns paginated agent executions with their events embedded, ordered by started_at DESC.
+ * Returns paginated threads (one per Cursor conversation) with embedded events.
+ * Response shape compatible with AgentExecution model; id is thread.id.
  */
 router.get("/", async (req: Request, res: Response<unknown, AuthLocals>): Promise<void> => {
   const supabase = getSupabaseForUser(res.locals.accessToken);
@@ -43,116 +44,102 @@ router.get("/", async (req: Request, res: Response<unknown, AuthLocals>): Promis
     return;
   }
 
-  // ——— Paginate by session (conversation_id / session_id), not by individual turn rows ———
-  //
-  // Each Cursor composer conversation = one session_id = one thread in the app.
-  // A session can have many turns (one agent_executions row per generation_id),
-  // so naively paginating rows gives unfair results for long conversations.
-  //
-  // Strategy:
-  //   1. Fetch a discovery batch ordered by updated_at DESC, exclude pending placeholders.
-  //   2. Deduplicate in JS to get the N most-recently-active sessions for this page.
-  //   3. Re-fetch ALL execution rows for those sessions (all turns).
-  //   4. Fetch all events for all of those execution rows.
-  //   5. Merge events per session into one response object per session.
-  //      The client receives one merged row per thread and does not need to re-group.
+  type ThreadRow = {
+    id: string;
+    instance_id: string;
+    conversation_id: string;
+    status: string;
+    prompt: string | null;
+    session_ended_at: string | null;
+    started_at: string;
+    updated_at: string;
+  };
 
   type ExecRow = {
     id: string;
+    thread_id: string;
     instance_id: string;
-    generation_id: string | null;
-    conversation_id: string | null;
-    session_id: string | null;
-    session_ended_at: string | null;
-    status: string;
+    generation_id: string;
     started_at: string;
     updated_at: string;
-    prompt: string | null;
-    model: string | null;
-    workspace_roots: string[] | null;
     blocked_since: string | null;
     blocking_event_type: string | null;
     blocking_tool_name: string | null;
   };
 
-  // ——— Step 1: Discover most-recent sessions via a JS-side dedup ———
-  // Fetch up to limit*20 rows (capped at 500) so we can reliably find limit distinct sessions
-  // even when individual sessions have many turns.
-  const DISCOVERY_BATCH = Math.min(limit * 20, 500);
-
-  const { data: discoveryRows, error: discoveryError } = await supabaseAdmin
-    .from("agent_executions")
-    .select("id, instance_id, session_id, conversation_id, updated_at, status")
+  // Fetch threads (paginated, exclude pending placeholders)
+  const { data: threads, error: threadsError } = await supabaseAdmin
+    .from("threads")
+    .select("id, instance_id, conversation_id, status, prompt, session_ended_at, started_at, updated_at")
     .in("instance_id", instanceIds)
     .neq("status", "pending")
     .order("updated_at", { ascending: false })
-    .limit(DISCOVERY_BATCH);
+    .range(offset, offset + limit - 1);
 
-  if (discoveryError) {
-    res.status(500).json({ error: "Failed to fetch executions" });
+  if (threadsError) {
+    res.status(500).json({ error: "Failed to fetch threads" });
     return;
   }
 
-  if (!discoveryRows || discoveryRows.length === 0) {
+  if (!threads || threads.length === 0) {
     res.json({ executions: [], total: 0, limit, offset });
     return;
   }
 
-  // Deduplicate: first occurrence per session key wins (rows are updated_at DESC).
-  const seenKeys = new Set<string>();
-  const sessionReps: Array<{ id: string; session_id: string | null; conversation_id: string | null }> = [];
-  for (const row of discoveryRows as Array<{ id: string; session_id: string | null; conversation_id: string | null }>) {
-    const key = row.session_id ?? row.conversation_id ?? row.id;
-    if (!seenKeys.has(key)) {
-      seenKeys.add(key);
-      sessionReps.push(row);
-    }
-  }
+  // Total count for pagination (without fetching all)
+  const { count: totalCount, error: countError } = await supabaseAdmin
+    .from("threads")
+    .select("id", { count: "exact", head: true })
+    .in("instance_id", instanceIds)
+    .neq("status", "pending");
 
-  const total = sessionReps.length;
-  const pageReps = sessionReps.slice(offset, offset + limit);
-
-  if (pageReps.length === 0) {
-    res.json({ executions: [], total, limit, offset });
+  if (countError) {
+    res.status(500).json({ error: "Failed to count threads" });
     return;
   }
 
-  // ——— Step 2: Fetch ALL execution rows for each session in the page ———
-  const pageSessionIds = [
-    ...new Set(pageReps.map((r) => r.session_id).filter((s): s is string => s !== null)),
-  ];
-  const orphanIds = pageReps.filter((r) => !r.session_id).map((r) => r.id);
+  const total = totalCount ?? threads.length;
+  const threadIds = threads.map((t) => t.id);
 
-  const allSessionExecs: ExecRow[] = [];
+  // Fetch all executions for these threads
+  const { data: executions, error: execsError } = await supabaseAdmin
+    .from("agent_executions")
+    .select("id, thread_id, instance_id, generation_id, started_at, updated_at, blocked_since, blocking_event_type, blocking_tool_name")
+    .in("thread_id", threadIds)
+    .order("started_at", { ascending: true });
 
-  if (pageSessionIds.length > 0) {
-    const { data: sessExecs, error: sessExecsError } = await supabaseAdmin
-      .from("agent_executions")
-      .select("id, instance_id, generation_id, conversation_id, session_id, session_ended_at, status, started_at, updated_at, prompt, model, workspace_roots, blocked_since, blocking_event_type, blocking_tool_name")
-      .in("instance_id", instanceIds)
-      .in("session_id", pageSessionIds)
-      .order("started_at", { ascending: true });
-    if (sessExecsError) {
-      res.status(500).json({ error: "Failed to fetch session executions" });
-      return;
-    }
-    allSessionExecs.push(...((sessExecs ?? []) as ExecRow[]));
+  if (execsError) {
+    res.status(500).json({ error: "Failed to fetch executions" });
+    return;
   }
 
-  if (orphanIds.length > 0) {
-    const { data: orphanExecs, error: orphanError } = await supabaseAdmin
-      .from("agent_executions")
-      .select("id, instance_id, generation_id, conversation_id, session_id, session_ended_at, status, started_at, updated_at, prompt, model, workspace_roots, blocked_since, blocking_event_type, blocking_tool_name")
-      .in("id", orphanIds);
-    if (orphanError) {
-      res.status(500).json({ error: "Failed to fetch orphan executions" });
-      return;
-    }
-    allSessionExecs.push(...((orphanExecs ?? []) as ExecRow[]));
+  const allExecs = (executions ?? []) as ExecRow[];
+  const allExecIds = allExecs.map((e) => e.id);
+
+  if (allExecIds.length === 0) {
+    const result = (threads as ThreadRow[]).map((t) => ({
+      id: t.id,
+      instance_id: t.instance_id,
+      generation_id: null,
+      conversation_id: t.conversation_id,
+      session_id: t.conversation_id,
+      session_ended_at: t.session_ended_at,
+      status: t.status,
+      started_at: t.started_at,
+      updated_at: t.updated_at,
+      prompt: t.prompt,
+      model: null,
+      workspace_roots: null,
+      blocked_since: null,
+      blocking_event_type: null,
+      blocking_tool_name: null,
+      events: [],
+    }));
+    res.json({ executions: result, total, limit, offset });
+    return;
   }
 
-  // ——— Step 3: Fetch all events for all of those execution rows ———
-  const allExecIds = allSessionExecs.map((e) => e.id);
+  // Fetch all events for these executions
   const { data: events, error: eventsError } = await supabaseAdmin
     .from("cursor_events")
     .select("id, instance_id, execution_id, event_type, semantic_type, payload, created_at")
@@ -164,7 +151,6 @@ router.get("/", async (req: Request, res: Response<unknown, AuthLocals>): Promis
     return;
   }
 
-  // ——— Step 4: Group events by execution_id ———
   const eventsByExecution = new Map<string, unknown[]>();
   for (const event of events ?? []) {
     const eid = (event as { execution_id: string }).execution_id;
@@ -172,67 +158,67 @@ router.get("/", async (req: Request, res: Response<unknown, AuthLocals>): Promis
     eventsByExecution.get(eid)!.push(event);
   }
 
-  // ——— Step 5: Merge all execution rows + events per session into one response object ———
-  // Returns one merged row per session/thread. The client receives one object per thread
-  // with all events already combined and sorted, and started_at set to the earliest turn.
-  const result = pageReps
-    .map((rep) => {
-      const sessionKey = rep.session_id ?? rep.conversation_id ?? rep.id;
-      const sessionExecs = allSessionExecs.filter((e) => (e.session_id ?? e.conversation_id ?? e.id) === sessionKey);
+  // Build one response object per thread
+  const result = (threads as ThreadRow[]).map((t) => {
+    const threadExecs = allExecs.filter((e) => e.thread_id === t.id);
+    const latestExec = threadExecs.reduce(
+      (l, e) => (e.updated_at > l.updated_at ? e : l),
+      threadExecs[0]
+    );
+    const startedAt = threadExecs.reduce(
+      (min, e) => (e.started_at < min ? e.started_at : min),
+      threadExecs[0].started_at
+    );
+    const mergedEvents = threadExecs
+      .flatMap((e) => (eventsByExecution.get(e.id) ?? []) as Array<{ created_at: string }>)
+      .sort((a, b) => a.created_at.localeCompare(b.created_at));
 
-      if (sessionExecs.length === 0) {
-        // Avoid returning incomplete rep (missing started_at, etc.) which would break the client.
-        return null;
-      }
-
-      // Most-recently-updated execution provides the authoritative status / updated_at
-      const latest = sessionExecs.reduce((l, e) => (e.updated_at > l.updated_at ? e : l), sessionExecs[0]);
-      // Earliest started_at is the session start
-      const startedAt = sessionExecs.reduce(
-        (min, e) => (e.started_at < min ? e.started_at : min),
-        sessionExecs[0].started_at
-      );
-
-      // Collect and chronologically sort all events from all turns in the session
-      const mergedEvents = sessionExecs
-        .flatMap((e) => (eventsByExecution.get(e.id) ?? []) as Array<{ created_at: string }>)
-        .sort((a, b) => a.created_at.localeCompare(b.created_at));
-
-      return {
-        ...latest,
-        started_at: startedAt,
-        events: mergedEvents,
-      };
-    })
-    .filter((r): r is NonNullable<typeof r> => r != null);
+    return {
+      id: t.id,
+      instance_id: t.instance_id,
+      generation_id: latestExec?.generation_id ?? null,
+      conversation_id: t.conversation_id,
+      session_id: t.conversation_id,
+      session_ended_at: t.session_ended_at,
+      status: t.status,
+      started_at: startedAt,
+      updated_at: t.updated_at,
+      prompt: t.prompt,
+      model: null,
+      workspace_roots: null,
+      blocked_since: latestExec?.blocked_since ?? null,
+      blocking_event_type: latestExec?.blocking_event_type ?? null,
+      blocking_tool_name: latestExec?.blocking_tool_name ?? null,
+      events: mergedEvents,
+    };
+  });
 
   res.json({ executions: result, total, limit, offset });
 });
 
 /**
  * DELETE /api/executions/:id
- * Deletes an execution and all its events (cascade). Verifies ownership.
+ * Deletes a thread by id (cascades to executions and events). Verifies ownership.
  */
 router.delete("/:id", async (req: Request, res: Response<unknown, AuthLocals>): Promise<void> => {
   const supabase = getSupabaseForUser(res.locals.accessToken);
   const { id } = req.params;
 
-  const { data: execution, error: fetchError } = await supabaseAdmin
-    .from("agent_executions")
+  const { data: thread, error: fetchError } = await supabaseAdmin
+    .from("threads")
     .select("id, instance_id")
     .eq("id", id)
     .single();
 
-  if (fetchError || !execution) {
-    res.status(404).json({ error: "Execution not found" });
+  if (fetchError || !thread) {
+    res.status(404).json({ error: "Thread not found" });
     return;
   }
 
-  // Verify ownership via user-scoped client
   const { data: inst, error: instError } = await supabase
     .from("cursor_instances")
     .select("id")
-    .eq("id", (execution as { instance_id: string }).instance_id)
+    .eq("id", (thread as { instance_id: string }).instance_id)
     .single();
 
   if (instError || !inst) {
@@ -241,12 +227,12 @@ router.delete("/:id", async (req: Request, res: Response<unknown, AuthLocals>): 
   }
 
   const { error: deleteError } = await supabaseAdmin
-    .from("agent_executions")
+    .from("threads")
     .delete()
     .eq("id", id);
 
   if (deleteError) {
-    res.status(500).json({ error: "Failed to delete execution" });
+    res.status(500).json({ error: "Failed to delete thread" });
     return;
   }
 
@@ -255,13 +241,15 @@ router.delete("/:id", async (req: Request, res: Response<unknown, AuthLocals>): 
 
 /**
  * DELETE /api/executions
- * Bulk-delete: all for user, or scoped to instance_id, or to session_id (+ instance_id).
- * Query: instance_id?, session_id? (session_id requires instance_id).
+ * Bulk-delete: all for user, or scoped to instance_id, or to conversation_id (+ instance_id).
+ * Query: instance_id?, conversation_id? (conversation_id requires instance_id).
  */
 router.delete("/", async (req: Request, res: Response<unknown, AuthLocals>): Promise<void> => {
   const supabase = getSupabaseForUser(res.locals.accessToken);
   const instanceId = typeof req.query.instance_id === "string" ? req.query.instance_id : undefined;
+  const conversationId = typeof req.query.conversation_id === "string" ? req.query.conversation_id : undefined;
   const sessionId = typeof req.query.session_id === "string" ? req.query.session_id : undefined;
+  const effectiveConversationId = conversationId ?? sessionId;
 
   let instanceIds: string[];
   if (instanceId) {
@@ -292,16 +280,16 @@ router.delete("/", async (req: Request, res: Response<unknown, AuthLocals>): Pro
   }
 
   let query = supabaseAdmin
-    .from("agent_executions")
+    .from("threads")
     .delete({ count: "exact" })
     .in("instance_id", instanceIds);
-  if (sessionId != null) {
-    query = query.eq("session_id", sessionId);
+  if (effectiveConversationId != null) {
+    query = query.eq("conversation_id", effectiveConversationId);
   }
   const { error: deleteError, count } = await query;
 
   if (deleteError) {
-    res.status(500).json({ error: "Failed to delete executions" });
+    res.status(500).json({ error: "Failed to delete threads" });
     return;
   }
 

@@ -7,16 +7,26 @@ const BLOCKING_CHECK_INTERVAL_MS = 30_000;
 
 /**
  * Finds executions that are due for a blocking check (blocking_check_at <= now),
- * sends agentBlocked push, and marks them blocked. Survives process restarts.
+ * whose thread is still running/blocked. Sends agentBlocked push, marks execution and thread blocked.
  */
 async function runBlockingCheck(): Promise<void> {
   const now = new Date().toISOString();
+
+  const { data: activeThreads, error: threadsError } = await supabaseAdmin
+    .from("threads")
+    .select("id")
+    .in("status", ["running", "blocked"]);
+
+  if (threadsError || !activeThreads?.length) return;
+
+  const threadIds = activeThreads.map((t: { id: string }) => t.id);
+
   const { data: rows, error } = await supabaseAdmin
     .from("agent_executions")
     .select(
-      "id, instance_id, blocking_event_type, blocking_tool_name, blocking_payload, cursor_instances!inner(user_id, name)"
+      "id, thread_id, instance_id, blocking_event_type, blocking_tool_name, blocking_payload, cursor_instances!inner(user_id, name)"
     )
-    .in("status", ["running", "blocked"])
+    .in("thread_id", threadIds)
     .not("blocking_check_at", "is", null)
     .lte("blocking_check_at", now);
 
@@ -28,6 +38,7 @@ async function runBlockingCheck(): Promise<void> {
 
   for (const row of rows) {
     const executionId = row.id as string;
+    const threadId = row.thread_id as string;
     const instanceId = row.instance_id as string;
     const raw = row.cursor_instances as { user_id: string; name: string | null } | { user_id: string; name: string | null }[] | null;
     const instance = Array.isArray(raw) ? raw[0] : raw;
@@ -37,26 +48,26 @@ async function runBlockingCheck(): Promise<void> {
     const payload = (row.blocking_payload ?? {}) as CursorHookPayload;
 
     try {
-      await sendPushNotification(userId, "agentBlocked", payload, instanceName, instanceId, executionId);
+      await sendPushNotification(userId, "agentBlocked", payload, instanceName, instanceId, executionId, threadId);
     } catch (err) {
       console.error("[blockingCheckWorker] sendPushNotification error for executionId=%s:", executionId, err);
     }
 
-    const { error: updateError } = await supabaseAdmin
+    await supabaseAdmin
       .from("agent_executions")
       .update({
-        status: "blocked",
         blocked_since: now,
         blocking_check_at: null,
         blocking_payload: null,
       })
       .eq("id", executionId);
 
-    if (updateError) {
-      console.error("[blockingCheckWorker] update error for executionId=%s:", executionId, updateError.message);
-    } else {
-      console.log("[blockingCheckWorker] marked blocked executionId=%s", executionId);
-    }
+    await supabaseAdmin
+      .from("threads")
+      .update({ status: "blocked", updated_at: now })
+      .eq("id", threadId);
+
+    console.log("[blockingCheckWorker] marked blocked executionId=%s threadId=%s", executionId, threadId);
   }
 }
 

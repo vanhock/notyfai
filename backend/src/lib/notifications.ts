@@ -68,25 +68,36 @@ export async function sendPushNotification(
   payload: CursorHookPayload,
   instanceName: string | null,
   instanceId: string,
-  executionId?: string
+  executionId?: string,
+  threadId?: string
 ): Promise<void> {
-  const throttleKey = executionId ?? userId;
+  const throttleKey = threadId ?? executionId ?? userId;
   const last = lastNotificationSentAt.get(throttleKey);
   if (last !== undefined && Date.now() - last < NOTIFICATION_THROTTLE_MS) {
-    console.log("[notifications] throttled push for execution %s (last sent %dms ago)", throttleKey, Date.now() - last);
+    console.log("[notifications] throttled push for %s (last sent %dms ago)", throttleKey, Date.now() - last);
     return;
   }
   lastNotificationSentAt.set(throttleKey, Date.now());
 
   let prompt: string | null = null;
+  let resolvedThreadId: string | null = null;
   if (executionId) {
-    const { data: row } = await supabaseAdmin
+    const { data: execRow } = await supabaseAdmin
       .from("agent_executions")
-      .select("prompt")
+      .select("thread_id")
       .eq("id", executionId)
       .single();
-    if (row?.prompt != null) prompt = row.prompt as string;
+    if (execRow) {
+      resolvedThreadId = (execRow as { thread_id: string }).thread_id;
+      const { data: threadRow } = await supabaseAdmin
+        .from("threads")
+        .select("prompt")
+        .eq("id", resolvedThreadId)
+        .single();
+      if (threadRow?.prompt != null) prompt = threadRow.prompt as string;
+    }
   }
+  const effectiveThreadId = threadId ?? resolvedThreadId;
 
   const { data: tokens, error } = await supabaseAdmin
     .from("push_tokens")
@@ -112,6 +123,7 @@ export async function sendPushNotification(
     tokens.map(async ({ id, token, platform }: { id: string; token: string; platform: string }) => {
       try {
         const data: Record<string, string> = { instance_id: instanceId };
+        if (effectiveThreadId) data.thread_id = effectiveThreadId;
         if (executionId) data.execution_id = executionId;
 
         await messaging.send({
