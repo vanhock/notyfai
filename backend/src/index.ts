@@ -10,6 +10,7 @@ import eventsRouter from "./routes/events.js";
 import executionsRouter from "./routes/executions.js";
 import accountRouter from "./routes/account.js";
 import subscriptionsRouter from "./routes/subscriptions.js";
+import { startBlockingCheckWorker } from "./lib/blockingCheckWorker.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -33,4 +34,5 @@ app.use("/api/subscriptions", requireAuth, subscriptionsRouter);
 
 app.listen(PORT, () => {
   console.log(`Notyfai backend listening on port ${PORT}`);
+  startBlockingCheckWorker();
 });
