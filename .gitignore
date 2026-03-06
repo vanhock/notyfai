@@ -26,6 +26,7 @@ backend/.env.*.local
 npm-debug.log*
 
 # Build / output
-backend/dist/
+backend/dist/**/*
 *.tsbuildinfo
 backend/supabase/.temp/cli-latest
+backend/dist/index.js
